@@ -2,6 +2,8 @@
 declare(strict_types=1);
 require_once 'vendor/autoload.php';
 
+date_default_timezone_set('Europe/Kiev');
+
 // ============================================================
 //  CONFIG — High Win-Rate Scalping v4
 //
