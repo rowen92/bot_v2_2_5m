@@ -1,0 +1,9 @@
+services:
+  binance-bot:
+    build: .
+    container_name: binance_php_bot
+    env_file:
+      - .env
+    volumes:
+      # Syncs files bidirectionally. Edits on your host sync to the container instantly.
+      - .:/usr/src/app
