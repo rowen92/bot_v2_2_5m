@@ -139,6 +139,8 @@ const CROSS_MAX_AGE_BARS   = 5;    // widened: was 3 (more valid entries at tigh
 // Minimum ATR as a % of price to justify entry after fees (0.04% × 2 legs)
 // Entry is skipped when market is too flat to cover round-trip cost
 const MIN_ATR_PCT          = 0.08;  // lowered: was 0.12 (tighter SL needs less ATR to cover fees)
+const TAKER_FEE_PCT        = 0.04;  // Binance futures taker fee per leg (0.04%)
+const ROUND_TRIP_FEE_USDT  = POSITION_USDT * LEVERAGE * (TAKER_FEE_PCT / 100.0) * 2; // entry + exit
 
 // ── Circuit-breaker: consecutive losses ──────────────────────
 const MAX_CONSEC_LOSSES    = 3;     // pause after this many losses in a row
@@ -719,6 +721,7 @@ function openPosition(\ccxt\binance $ex, string $side, float $price, int $precis
 function recordPaperTrade(float $pnl, int &$trades, float &$totalPnl, int &$wins, float &$peakPnl, float &$maxDrawdown): void
 {
   $trades++;
+  $pnl      -= ROUND_TRIP_FEE_USDT; // deduct Binance round-trip taker fees
   $totalPnl += $pnl;
   if ($pnl > 0) { $wins++; }
   // Update peak and max drawdown
