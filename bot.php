@@ -753,10 +753,10 @@ $warmupCandles = EMA_TREND + MACD_SLOW + MACD_SIGNAL_P + ATR_PERIOD + BB_PERIOD 
 $mode = DRY_RUN ? '🧪 DRY-RUN (paper)' : '🔴 LIVE TRADING';
 logToFile('╔══════════════════════════════════════════════════════╗');
 logToFile('║   WLD/USDT Futures — High Win-Rate Scalper v2        ║');
-logToFile('║   Mode    : ' . str_pad($mode, 43) . '║');
+logToFile('║   Mode    : ' . str_pad($mode, 43)                                          . ' ║');
 logToFile('║   Signal  : Score ≥' . SCORE_STRONG . '=strong  ≥' . SCORE_NORMAL . '=normal (9pts max)    ║');
-logToFile('║   Risk    : ATR×' . ATR_SL_MULT . ' SL / ATR×' . ATR_TP_MULT . ' TP  (2:1 R:R)         ║');
-logToFile('║   Trail   : BE@+' . TRAIL_BE_PCT . '%  Lock+' . TRAIL_LOCKED_GAIN . '%@+' . TRAIL_LOCK_PCT . '%              ║');
+logToFile('║   Risk    : ATR×' . ATR_SL_MULT . ' SL (scaled) / Trail-only exit      ║');
+logToFile('║   Trail   : BE@+' . TRAIL_BE_PCT . '%  Lock+' . TRAIL_LOCKED_GAIN . '%@+' . TRAIL_LOCK_PCT . '%             ║');
 logToFile('║   Filters : EMA9/21 + EMA50 + MACD + RSI + BB + HTF  ║');
 logToFile('╚══════════════════════════════════════════════════════╝');
 
@@ -1290,12 +1290,12 @@ if (DRY_RUN && $paperTrades > 0) {
   logToFile('╔══════════════════════════════════════════════════════╗');
   logToFile('║              DRY-RUN SESSION SUMMARY                 ║');
   logToFile('╠══════════════════════════════════════════════════════╣');
-  logToFile('║  Trades   : ' . str_pad((string)$paperTrades, 43)                         . '║');
-  logToFile('║  Wins     : ' . str_pad($paperWins . ' (' . $finalWinRate . '%)', 43)    . '║');
-  logToFile('║  Total PnL: ' . str_pad(number_format($paperPnlUsdt, 2) . ' USDT', 43)  . '║');
-  logToFile('║  Avg/trade: ' . str_pad(number_format($avgPnl, 2) . ' USDT', 43)        . '║');
+  logToFile('║  Trades   : ' . str_pad((string)$paperTrades, 43)                          . '║');
+  logToFile('║  Wins     : ' . str_pad($paperWins . ' (' . $finalWinRate . '%)', 43)      . '║');
+  logToFile('║  Total PnL: ' . str_pad(number_format($paperPnlUsdt, 2) . ' USDT', 43)    . '║');
+  logToFile('║  Avg/trade: ' . str_pad(number_format($avgPnl, 2) . ' USDT', 43)          . '║');
   logToFile('║  Max DD   : ' . str_pad('-' . number_format($maxDrawdown, 2) . ' USDT', 43) . '║');
-  logToFile('║  Peak PnL : ' . str_pad(number_format($peakPnl, 2) . ' USDT', 43)      . '║');
+  logToFile('║  Peak PnL : ' . str_pad(number_format($peakPnl, 2) . ' USDT', 43)        . '║');
   logToFile('╚══════════════════════════════════════════════════════╝');
 }
 

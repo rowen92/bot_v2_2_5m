@@ -1,9 +1,14 @@
 services:
   binance-bot:
-    build: .
+    build:
+      context: .
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
     container_name: binance_php_bot
+    restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"
     env_file:
       - .env
     volumes:
-      # Syncs files bidirectionally. Edits on your host sync to the container instantly.
       - .:/usr/src/app
