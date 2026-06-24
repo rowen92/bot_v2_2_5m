@@ -4,3 +4,4 @@ composer.lock
 trades.log
 trades.*.log
 .idea/
+bot_state.json
