@@ -59,7 +59,7 @@ const RSI_SHORT_MIN        = 32;   // widened: was 35
 const RSI_SHORT_MAX        = 55;   // widened: was 52
 
 // ── Volume ──────────────────────────────────────────────────
-const VOL_SPIKE_MULT       = 1.2;   // was 1.5 — fires more often, still filters dead vol
+const VOL_SPIKE_MULT       = 1.5;   // restored: losers all had Vol < 1.0× — dead volume filter
 
 // ── ATR-based risk ──────────────────────────────────────────
 // SL multiplier scales with ADX: tight in strong trends, wider in choppy markets.
@@ -104,7 +104,13 @@ const SR_BUFFER_PCT        = 0.30;  // 0.30% buffer zone around S/R levels
 
 // ── ATR trailing stop (continuous) ───────────────────────────
 // After breakeven, trail SL by ATR_TRAIL_MULT × ATR below/above highest seen price
-const ATR_TRAIL_MULT       = 0.7;   // trail distance = 0.7 × ATR (tighter for scalping)
+const ATR_TRAIL_MULT       = 0.7;   // trail distance = 0.7 × ATR (base — tighter for scalping)
+// When RSI is in extreme territory AND we hold a strong-momentum position,
+// use a wider trail so winners can run instead of being stopped too early.
+// Trade #1 was stopped at +0.20% with RSI=24.9 and score=9 — classic early exit.
+const ATR_TRAIL_MULT_WIDE  = 1.1;   // wider trail for RSI-extreme momentum moves
+const RSI_EXTREME_SHORT    = 30.0;  // RSI below this on a short = strong momentum, widen trail
+const RSI_EXTREME_LONG     = 70.0;  // RSI above this on a long  = strong momentum, widen trail
 
 // ── ADX (trend strength) ─────────────────────────────────────
 const ADX_PERIOD           = 14;
@@ -126,21 +132,38 @@ const EMA_TREND_SLOPE_MIN  = 0.05;  // EMA50 must move ≥ 0.05% over 5 bars
 // 1 = enter on first confirmed candle; trail handles the rest.
 const CONFIRM_CANDLES      = 1;     // was 2 — enter earlier, let trail capture the move
 
-// ── Scoring thresholds ───────────────────────────────────────
+// ── Scoring thresholds ───────────────────────────────────
 // Max score is now 10 pts (StochRSI added).
-const SCORE_STRONG         = 5;     // enter immediately  (lowered for more entries)
-const SCORE_NORMAL         = 4;     // enter after cooldown (lowered for more entries)
+// Raised based on log analysis: score-5 trades had 17% WR vs 60% for score≥7.
+const SCORE_STRONG         = 7;     // enter immediately  (raised: was 5)
+const SCORE_NORMAL         = 6;     // enter after cooldown (raised: was 4)
 
 // ── EMA cross staleness guard ────────────────────────────────
 // Cross must have happened within this many closed bars (else it's stale)
-const CROSS_MAX_AGE_BARS   = 5;    // widened: was 3 (more valid entries at tight TP)
+// Trade #2 used age:5 (25 min old cross) and lost — tightened back to 3.
+const CROSS_MAX_AGE_BARS   = 3;    // max 15 min old cross (was 5 — too stale)
 
 
+
+// ── RSI directional gate for entries without EMA cross ───────
+// When there is no fresh EMA9/21 cross, RSI must be in a committed zone:
+// - Shorts without cross: RSI must be ≤ 45 (price already falling, not mid-range)
+// - Longs  without cross: RSI must be ≥ 55 (price already rising, not mid-range)
+// Trades #2,#4,#12 all lost with RSI 43–53 and no EMA cross — mid-range with no direction.
+const RSI_ENTRY_MAX_SHORT_NO_CROSS = 45.0;  // short without EMA cross: RSI must be ≤ this
+const RSI_ENTRY_MIN_LONG_NO_CROSS  = 55.0;  // long  without EMA cross: RSI must be ≥ this
+
+// ── Minimum current-candle volume ratio ──────────────────────
+// Even if a recent candle had a volume spike, block entry if the
+// current candle volume is extremely thin (dead market).
+// Trades #9,#11,#12 entered with Vol:0.23–0.34× — all losses.
+const VOL_CURRENT_MIN_RATIO = 0.40;  // current candle must be ≥ 40% of avg20 to enter
 
 // ── Fee / spread filter ──────────────────────────────────────
 // Minimum ATR as a % of price to justify entry after fees (0.04% × 2 legs)
-// Entry is skipped when market is too flat to cover round-trip cost
-const MIN_ATR_PCT          = 0.08;  // lowered: was 0.12 (tighter SL needs less ATR to cover fees)
+// Entry is skipped when market is too flat to cover round-trip cost.
+// Raised from 0.08 — trades #1,#2 had ATR%<0.55 and both SL hits were noise-triggered.
+const MIN_ATR_PCT          = 0.45;  // raised: was 0.08 — blocks micro-volatility entries
 const TAKER_FEE_PCT        = 0.04;  // Binance futures taker fee per leg (0.04%)
 const ROUND_TRIP_FEE_USDT  = POSITION_USDT * LEVERAGE * (TAKER_FEE_PCT / 100.0) * 2; // entry + exit
 
@@ -157,9 +180,10 @@ const MAX_TRADE_SECS       = 900;  // 15 minutes = 3 × 5m candles max hold
 const MAX_DAILY_LOSS_USDT  = 15.0;  // stop trading for the day beyond this loss
 const MAX_DAILY_TRADES     = 40;    // max trades per calendar day (raised for scalping)
 
-// ── Timing ──────────────────────────────────────────────────
+// ── Timing ──────────────────────────────────────────────
 const COOLDOWN_STRONG      = 60;    // seconds between strong entries (was 180)
 const COOLDOWN_NORMAL      = 120;   // seconds for normal entries (was 300)
+const COOLDOWN_POST_SL     = 600;   // post-SL cooldown: 10 min = 2 candles (prevents revenge entries)
 const LOOP_SLEEP           = 10;   // check market 3× more often (was 30s)
 const MIN_NOTIONAL         = 5.5;
 const LOG_FILE             = __DIR__ . '/trades.log';
@@ -746,9 +770,41 @@ function recordPaperTrade(float $pnl, int &$trades, float &$totalPnl, int &$wins
 //  GRACEFUL SHUTDOWN
 // ============================================================
 $running = true;
+
+// Print session summary — called both from signal handler and at normal loop exit.
+// Extracted into a closure so it can fire on SIGTERM before the process is killed.
+$printSummary = function () use (&$paperTrades, &$paperWins, &$paperPnlUsdt, &$maxDrawdown, &$peakPnl): void {
+  if (!DRY_RUN || $paperTrades <= 0) { return; }
+  $finalWinRate = round($paperWins / $paperTrades * 100, 1);
+  $avgPnl       = round($paperPnlUsdt / $paperTrades, 2);
+  logToFile('');
+  logToFile('╔══════════════════════════════════════════════════════╗');
+  logToFile('║              DRY-RUN SESSION SUMMARY                 ║');
+  logToFile('╠══════════════════════════════════════════════════════╣');
+  logToFile('║  Trades   : ' . str_pad((string)$paperTrades, 43)                            . '║');
+  logToFile('║  Wins     : ' . str_pad($paperWins . ' (' . $finalWinRate . '%)', 43)        . '║');
+  logToFile('║  Total PnL: ' . str_pad(number_format($paperPnlUsdt, 2) . ' USDT', 43)      . '║');
+  logToFile('║  Avg/trade: ' . str_pad(number_format($avgPnl, 2) . ' USDT', 43)            . '║');
+  logToFile('║  Max DD   : ' . str_pad('-' . number_format($maxDrawdown, 2) . ' USDT', 43) . '║');
+  logToFile('║  Peak PnL : ' . str_pad(number_format($peakPnl, 2) . ' USDT', 43)          . '║');
+  logToFile('╚══════════════════════════════════════════════════════╝');
+};
+
 if (function_exists('pcntl_signal')) {
-  pcntl_signal(SIGINT,  function () use (&$running) { $running = false; });
-  pcntl_signal(SIGTERM, function () use (&$running) { $running = false; });
+  // Use async signals so the handler fires immediately on SIGTERM
+  // instead of waiting for the next pcntl_signal_dispatch() call.
+  // Without this, `docker compose stop` (SIGTERM → SIGKILL after 10s)
+  // kills the process before the loop top is reached again.
+  if (function_exists('pcntl_async_signals')) { pcntl_async_signals(true); }
+
+  $shutdownHandler = function () use (&$running, $printSummary): void {
+    $running = false;
+    $printSummary();
+    logToFile('[*] Bot shutdown gracefully (signal).');
+    exit(0);
+  };
+  pcntl_signal(SIGINT,  $shutdownHandler);
+  pcntl_signal(SIGTERM, $shutdownHandler);
 }
 
 // ============================================================
@@ -787,6 +843,15 @@ $positionOpenAt = 0;
 // ── Circuit-breaker state ────────────────────────────────────
 $consecLosses      = 0;
 $circuitBrokenAt   = 0;  // timestamp when circuit tripped (0 = not tripped)
+
+// ── Post-SL cooldown ─────────────────────────────────────────
+$lastSlTime        = 0;   // timestamp of last stop-loss hit (0 = no recent SL)
+
+// ── Minimum inter-trade gap ───────────────────────────────────
+// Prevents opening a new position on the same candle a previous one just closed
+// (Trade #8 closed and Trade #9 opened at the exact same timestamp 07:35:14).
+$lastTradeCloseTime = 0;  // timestamp of last trade close (any outcome)
+const MIN_INTER_TRADE_SECS = 60; // at least 1 candle gap between any two trades
 
 // ── Daily risk-cap state ─────────────────────────────────────
 $dailyDate         = date('Y-m-d');  // track calendar day
@@ -963,8 +1028,13 @@ while ($running) {
         // ── Step 3: ATR continuous trail (always active, tightest wins) ─
         // Runs from the very first tick — before BE too.
         // The "never widen" rule ensures it can only improve the initial SL.
+        // Use a wider multiplier when RSI is in extreme territory (momentum trade)
+        // to prevent premature exit on strong moves (e.g. Trade #1: RSI=24.9 stopped at +0.20%).
         if ($atr > 0.0) {
-          $atrTrailDist = $atr * ATR_TRAIL_MULT;
+          $rsiExtreme   = ($currentSide === 'short' && $rsi < RSI_EXTREME_SHORT)
+                       || ($currentSide === 'long'  && $rsi > RSI_EXTREME_LONG);
+          $trailMult    = ($rsiExtreme && $trailBreakeven) ? ATR_TRAIL_MULT_WIDE : ATR_TRAIL_MULT;
+          $atrTrailDist = $atr * $trailMult;
           if ($currentSide === 'long') {
             $newSL = $currentPrice - $atrTrailDist;
             if ($newSL > $activeSL) {      // only move SL up, never down
@@ -979,15 +1049,24 @@ while ($running) {
         }
 
         // ── Stale position timeout ───────────────────────────
-        // If BE not reached and held longer than MAX_TRADE_SECS → force close.
-        // Prevents capital being locked in a dead trade while fees tick up.
-        $staleTimeout = !$trailBreakeven
-                     && $positionOpenAt > 0
-                     && (time() - $positionOpenAt) >= MAX_TRADE_SECS;
+        // Force-close if:
+        //   a) BE never reached AND held > MAX_TRADE_SECS, OR
+        //   b) BE reached but trade is still open after 2× MAX_TRADE_SECS (stuck winner)
+        // Trade #10 lost -3.03 USDT on timeout — also flag post-SL cooldown on timeout loss.
+        $heldSecs     = $positionOpenAt > 0 ? (time() - $positionOpenAt) : 0;
+        $staleTimeout = $positionOpenAt > 0 && (
+          (!$trailBreakeven && $heldSecs >= MAX_TRADE_SECS) ||
+          ($trailBreakeven  && $heldSecs >= MAX_TRADE_SECS * 2)
+        );
         if ($staleTimeout) {
           closePosition($exchange, $currentSide, 'TIMEOUT ' . number_format($pnlPct, 2) . '% (' . number_format($pnlUsdt, 2) . ' USDT)', $currentPrice);
           if (DRY_RUN) { recordPaperTrade($pnlUsdt, $paperTrades, $paperPnlUsdt, $paperWins, $peakPnl, $maxDrawdown); }
-          logToFile((DRY_RUN ? DRY_PREFIX : '') . '⏱️ Stale position closed after ' . MAX_TRADE_SECS . 's with no BE.');
+          logToFile((DRY_RUN ? DRY_PREFIX : '') . '⏱️ Stale position closed after ' . $heldSecs . 's.');
+          // Apply post-SL cooldown on timeout losses too
+          if ($pnlUsdt < 0.0) {
+            $lastSlTime = time();
+            logToFile((DRY_RUN ? DRY_PREFIX : '') . '⏸️ Post-SL cooldown started (timeout loss) — ' . (COOLDOWN_POST_SL / 60) . ' min.');
+          }
           $dailyTradeCount++;
           if ($pnlUsdt < 0.0) {
             $dailyLossUsdt += $pnlUsdt;
@@ -1001,6 +1080,7 @@ while ($running) {
           if (count($rollingResults) > ROLLING_WINDOW) { array_shift($rollingResults); }
           $currentSide = null; $paperEntryPrice = 0.0; $activeSL = 0.0; $activeTP = 0.0;
           $trailBreakeven = false; $trailLocked = false; $positionOpenAt = 0; $lastSignalTime = 0;
+          $lastTradeCloseTime = time();
         }
 
         // ── Hit trailing SL (only exit on the profit side) ───
@@ -1017,6 +1097,12 @@ while ($running) {
             $currentPrice
           );
           if (DRY_RUN) { recordPaperTrade($pnlUsdt, $paperTrades, $paperPnlUsdt, $paperWins, $peakPnl, $maxDrawdown); }
+
+          // ── Post-SL cooldown: block re-entry for 2 candles ─
+          if ($pnlUsdt < 0.0) {
+            $lastSlTime = time();
+            logToFile((DRY_RUN ? DRY_PREFIX : '') . '⏸️ Post-SL cooldown started — no new entry for ' . (COOLDOWN_POST_SL / 60) . ' min.');
+          }
 
           // ── Update daily + circuit-breaker counters ────────
           $dailyTradeCount++;
@@ -1040,14 +1126,15 @@ while ($running) {
             array_shift($rollingResults);
           }
 
-          $currentSide     = null;
-          $paperEntryPrice = 0.0;
-          $activeSL        = 0.0;
-          $activeTP        = 0.0;
-          $trailBreakeven  = false;
-          $trailLocked     = false;
-          $positionOpenAt  = 0;
-          $lastSignalTime  = 0;
+          $currentSide        = null;
+          $paperEntryPrice    = 0.0;
+          $activeSL           = 0.0;
+          $activeTP           = 0.0;
+          $trailBreakeven     = false;
+          $trailLocked        = false;
+          $positionOpenAt     = 0;
+          $lastSignalTime     = 0;
+          $lastTradeCloseTime = time();
         }
       }
     }
@@ -1147,7 +1234,45 @@ while ($running) {
     $htf2BlockLong  = $htf2Bear === true;   // 1h bearish → no longs
     $htf2BlockShort = $htf2Bull === true;   // 1h bullish → no shorts
 
-    $tradingHalted = $circuitOpen || $dailyLossCap || $dailyTradeCap || $marketTooFlat || $bbSqueeze || $adxChop;
+    // Post-SL cooldown gate: block all entries for COOLDOWN_POST_SL seconds after a loss
+    $postSlCooldown = $lastSlTime > 0 && (time() - $lastSlTime) < COOLDOWN_POST_SL;
+
+    // Minimum inter-trade gap: block entry if the last trade closed too recently (any outcome).
+    // Prevents same-candle re-entries (e.g. Trade #8→#9 at 07:35:14, Trade #11→#12 at 10:35:03).
+    $interTradeTooSoon = $lastTradeCloseTime > 0 && (time() - $lastTradeCloseTime) < MIN_INTER_TRADE_SECS;
+
+    $tradingHalted = $circuitOpen || $dailyLossCap || $dailyTradeCap || $marketTooFlat || $bbSqueeze || $adxChop || $postSlCooldown || $interTradeTooSoon;
+
+    // ── Mandatory entry gates (EMA cross + Volume) ────────────
+    // EMA9/21 cross MUST be present and fresh — no cross = no trade regardless of score.
+    // Volume: require a spike in ANY of the last 3 closed candles in the signal direction.
+    // Checking only the entry candle (Trade #5: Vol:0.26×) blocks valid momentum trades;
+    // checking recent candles confirms the move had real participation.
+    $hasEmaCrossLong  = $crossAge['bullAge'] > 0 && $crossAge['bullAge'] <= CROSS_MAX_AGE_BARS;
+    $hasEmaCrossShort = $crossAge['bearAge'] > 0 && $crossAge['bearAge'] <= CROSS_MAX_AGE_BARS;
+    $recentVolSpike = false;
+    for ($vi = 1; $vi <= 3; $vi++) {
+      $vIdx = $n - $vi;
+      if ($vIdx < 1) { break; }
+      $vBar = (float)$volumes[$vIdx];
+      if ($volAvg > 0.00001 && $vBar >= $volAvg * VOL_SPIKE_MULT) { $recentVolSpike = true; break; }
+    }
+    // Current candle volume must not be dead (< 40% of avg) regardless of recent spikes.
+    // Trades #9 Vol:0.23×, #11 Vol:0.34×, #12 Vol:0.23× — all losses entered in dead markets.
+    $currentVolRatioOk = $volAvg < 0.00001 || ($volNow / $volAvg) >= VOL_CURRENT_MIN_RATIO;
+
+    $hasVolumeLong    = $recentVolSpike && $currentVolRatioOk;
+    $hasVolumeShort   = $recentVolSpike && $currentVolRatioOk;
+
+    // RSI directional gate when no fresh EMA cross is present.
+    // Without cross confirmation, RSI must already be in a committed directional zone.
+    // Trades #2,#4,#12 had RSI 43–53 with no cross — mid-range entries, all losses.
+    $rsiOkForShortNoCross = $rsi <= RSI_ENTRY_MAX_SHORT_NO_CROSS;
+    $rsiOkForLongNoCross  = $rsi >= RSI_ENTRY_MIN_LONG_NO_CROSS;
+    // If we DO have a cross, RSI zone is already partially validated by the scorer — allow wider range.
+    // If we DON'T have a cross, RSI must confirm direction independently.
+    $rsiGateShort = $hasEmaCrossShort || $rsiOkForShortNoCross;
+    $rsiGateLong  = $hasEmaCrossLong  || $rsiOkForLongNoCross;
 
     // ── Adaptive score threshold (rolling win-rate) ───────────
     // If recent win-rate is poor, demand a stronger signal before entering.
@@ -1182,7 +1307,8 @@ while ($running) {
       $pnlStr = ' PnL:' . number_format($livePct, 2) . '%';
     }
     $haltReason = $adxChop ? 'CHOP' : ($marketTooFlat ? 'FLAT' : ($bbSqueeze ? 'SQUEEZE' :
-                  ($circuitOpen ? 'CB' : ($dailyLossCap ? 'DLOSS' : 'DTRADE'))));
+                  ($circuitOpen ? 'CB' : ($dailyLossCap ? 'DLOSS' : ($postSlCooldown ? 'SLCD' :
+                  ($interTradeTooSoon ? 'ITCD' : 'DTRADE'))))));
     $haltStr    = $tradingHalted ? " 🚫HALT({$haltReason})" : '';
 
     logToFile(sprintf(
@@ -1208,10 +1334,10 @@ while ($running) {
     $ready         = $n > $warmupCandles;
     $elapsed       = time() - $lastSignalTime;
 
-    $canStrongLong = $ready && !$tradingHalted && !$srWallLong  && !$htf2BlockLong  && $elapsed >= COOLDOWN_STRONG && $scores['long']  >= $adaptiveStrong;
-    $canNormLong   = $ready && !$tradingHalted && !$srWallLong  && !$htf2BlockLong  && $elapsed >= COOLDOWN_NORMAL && $scores['long']  >= $adaptiveNormal && $scores['long']  < $adaptiveStrong;
-    $canStrongShort= $ready && !$tradingHalted && !$srWallShort && !$htf2BlockShort && $elapsed >= COOLDOWN_STRONG && $scores['short'] >= $adaptiveStrong;
-    $canNormShort  = $ready && !$tradingHalted && !$srWallShort && !$htf2BlockShort && $elapsed >= COOLDOWN_NORMAL && $scores['short'] >= $adaptiveNormal && $scores['short'] < $adaptiveStrong;
+    $canStrongLong = $ready && !$tradingHalted && !$srWallLong  && !$htf2BlockLong  && $hasEmaCrossLong  && $hasVolumeLong  && $rsiGateLong  && $elapsed >= COOLDOWN_STRONG && $scores['long']  >= $adaptiveStrong;
+    $canNormLong   = $ready && !$tradingHalted && !$srWallLong  && !$htf2BlockLong  && $hasEmaCrossLong  && $hasVolumeLong  && $rsiGateLong  && $elapsed >= COOLDOWN_NORMAL && $scores['long']  >= $adaptiveNormal && $scores['long']  < $adaptiveStrong;
+    $canStrongShort= $ready && !$tradingHalted && !$srWallShort && !$htf2BlockShort && $hasEmaCrossShort && $hasVolumeShort && $rsiGateShort && $elapsed >= COOLDOWN_STRONG && $scores['short'] >= $adaptiveStrong;
+    $canNormShort  = $ready && !$tradingHalted && !$srWallShort && !$htf2BlockShort && $hasEmaCrossShort && $hasVolumeShort && $rsiGateShort && $elapsed >= COOLDOWN_NORMAL && $scores['short'] >= $adaptiveNormal && $scores['short'] < $adaptiveStrong;
 
     $longSignal  = $currentSide !== 'long'  && ($canStrongLong  || $canNormLong);
     $shortSignal = $currentSide !== 'short' && ($canStrongShort || $canNormShort);
@@ -1288,20 +1414,8 @@ while ($running) {
 // ============================================================
 //  SESSION SUMMARY
 // ============================================================
-if (DRY_RUN && $paperTrades > 0) {
-  $finalWinRate = round($paperWins / $paperTrades * 100, 1);
-  $avgPnl       = round($paperPnlUsdt / $paperTrades, 2);
-  logToFile('');
-  logToFile('╔══════════════════════════════════════════════════════╗');
-  logToFile('║              DRY-RUN SESSION SUMMARY                 ║');
-  logToFile('╠══════════════════════════════════════════════════════╣');
-  logToFile('║  Trades   : ' . str_pad((string)$paperTrades, 43)                          . '║');
-  logToFile('║  Wins     : ' . str_pad($paperWins . ' (' . $finalWinRate . '%)', 43)      . '║');
-  logToFile('║  Total PnL: ' . str_pad(number_format($paperPnlUsdt, 2) . ' USDT', 43)    . '║');
-  logToFile('║  Avg/trade: ' . str_pad(number_format($avgPnl, 2) . ' USDT', 43)          . '║');
-  logToFile('║  Max DD   : ' . str_pad('-' . number_format($maxDrawdown, 2) . ' USDT', 43) . '║');
-  logToFile('║  Peak PnL : ' . str_pad(number_format($peakPnl, 2) . ' USDT', 43)        . '║');
-  logToFile('╚══════════════════════════════════════════════════════╝');
-}
-
+// Normal loop exit (e.g. $running set to false without a signal).
+// Signal handler already prints the summary and calls exit(0), so this
+// path only runs on a clean programmatic shutdown (not `make stop`).
+$printSummary();
 logToFile('[*] Bot shutdown gracefully.');
