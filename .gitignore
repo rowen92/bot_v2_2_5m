@@ -3,5 +3,17 @@ composer.lock
 .env
 trades.log
 trades.*.log
+positions.log
 .idea/
 bot_state.json
+
+# Python bytecode — never commit these
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
