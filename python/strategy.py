@@ -211,10 +211,16 @@ class ScalpingStrategy:
         """
         Return True if the latest OI reading is above the rolling mean
         of the last OI_MEAN_BARS readings (avoids trading into OI drain).
+        Requires at least OI_MEAN_BARS readings — returns False (blocking)
+        until enough data is collected, same conservative stance as _oi_is_rising.
         """
         history = state.oi_history
         if len(history) < self._oi_mean_bars:
-            return True   # not enough data yet — permissive
+            log.debug(
+                f"OI mean filter: not enough data "
+                f"({len(history)}/{self._oi_mean_bars}) — blocking trade"
+            )
+            return False  # conservative: don't trade without enough OI history
         window     = list(history)[-(self._oi_mean_bars):]
         mean_oi    = sum(window) / len(window)
         latest_oi  = history[-1]

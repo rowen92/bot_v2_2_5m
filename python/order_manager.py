@@ -1,5 +1,7 @@
 from __future__ import annotations
+import asyncio
 import logging
+import time
 import uuid
 from typing import Optional
 from binance import AsyncClient
@@ -30,11 +32,13 @@ class OrderManager:
             log.warning("open skipped: mark_price not ready")
             return None
 
-        balance = (
-            state.paper_balance
-            if cfg.is_paper()
-            else await self._live_balance(client)
-        )
+        if cfg.is_paper():
+            balance = state.paper_balance
+        else:
+            balance = await self._live_balance(client)
+            # Keep snapshot current so daily_loss_pct() always has a fresh base.
+            if balance > 0:
+                state.live_balance_snapshot = balance
         qty = rm.position_size(entry, balance)
         if qty <= 0:
             log.warning(f"open skipped: position_size=0  balance={balance:.2f}  entry={entry:.4f}")
@@ -90,7 +94,7 @@ class OrderManager:
             pos.open_time,
         )
         state.record_pnl(pnl)
-        state.last_close_candle = state.candle_count()   # start cooldown
+        state.last_close_ts = time.time()   # start cooldown (wall-clock, survives restarts)
         state.position = None
         tlog.log_daily_stats(state)
         return pnl
@@ -107,6 +111,11 @@ class OrderManager:
         """Check if TP or SL has been touched; close if so."""
         pos = state.position
         if pos is None:
+            return
+
+        # Guard: if a close is already in-flight (previous tick still awaiting
+        # Binance response), skip this tick entirely to avoid a double-close.
+        if state.is_closing:
             return
 
         price = state.mark_price
@@ -133,7 +142,11 @@ class OrderManager:
                     hit = "sl"
 
         if hit:
-            await self.close_position(hit, state, client)
+            state.is_closing = True
+            try:
+                await self.close_position(hit, state, client)
+            finally:
+                state.is_closing = False
 
     # ------------------------------------------------------------------
     # PAPER HELPERS
@@ -178,6 +191,32 @@ class OrderManager:
     # ------------------------------------------------------------------
 
     @staticmethod
+    async def _emergency_close(
+        client: AsyncClient, symbol: str, close_side: str, qty: float,
+        retries: int = 3,
+    ) -> None:
+        """
+        Best-effort market close to flatten a naked position.
+        Retries up to `retries` times before giving up and alerting.
+        """
+        for attempt in range(1, retries + 1):
+            try:
+                await client.futures_create_order(
+                    symbol=symbol, side=close_side, type="MARKET",
+                    quantity=qty, reduceOnly=True,
+                )
+                log.info(f"Emergency close succeeded on attempt {attempt}")
+                return
+            except Exception as exc:
+                log.error(f"Emergency close attempt {attempt}/{retries} failed: {exc}")
+                if attempt < retries:
+                    await asyncio.sleep(1)
+        log.critical(
+            f"EMERGENCY CLOSE FAILED after {retries} attempts — "
+            f"MANUAL INTERVENTION REQUIRED: {symbol} {close_side} qty={qty}"
+        )
+
+    @staticmethod
     async def _live_open(
         signal: str, entry: float, qty: float,
         tp: float, sl: float, client: AsyncClient,
@@ -219,10 +258,7 @@ class OrderManager:
             )
         except Exception as exc:
             log.error(f"live_open TP placement failed — emergency close: {exc}")
-            await client.futures_create_order(
-                symbol=symbol, side=close_side, type="MARKET",
-                quantity=qty, reduceOnly=True,
-            )
+            await OrderManager._emergency_close(client, symbol, close_side, qty)
             return None
 
         try:
@@ -238,10 +274,7 @@ class OrderManager:
         except Exception as exc:
             log.error(f"live_open SL placement failed — emergency close: {exc}")
             await client.futures_cancel_all_open_orders(symbol=symbol)
-            await client.futures_create_order(
-                symbol=symbol, side=close_side, type="MARKET",
-                quantity=qty, reduceOnly=True,
-            )
+            await OrderManager._emergency_close(client, symbol, close_side, qty)
             return None
 
         return Position(
@@ -260,12 +293,35 @@ class OrderManager:
             # Cancel any open TP/SL orders first
             await client.futures_cancel_all_open_orders(symbol=cfg.SYMBOL)
 
+            # ── Race-condition guard ──────────────────────────────────────────
+            # Binance may have already filled our static TP/SL order at the same
+            # moment Python's trail fired. Check the real position size before
+            # sending a market close to avoid opening an unintended reverse position.
+            actual_qty = pos.qty
+            try:
+                positions = await client.futures_position_information(symbol=cfg.SYMBOL)
+                for p in positions:
+                    if p.get("symbol") == cfg.SYMBOL:
+                        actual_qty = abs(float(p.get("positionAmt", pos.qty)))
+                        break
+            except Exception as exc:
+                log.warning(f"live_close: could not verify position size on exchange: {exc}")
+
+            if actual_qty == 0:
+                log.warning(
+                    "live_close: position already closed on Binance (TP/SL filled first) — "
+                    "skipping duplicate market order"
+                )
+                # Best-effort PnL estimate using the mark price we have
+                return rm.calc_pnl(pos.entry_price, exit_price, pos.qty, pos.side)
+            # ─────────────────────────────────────────────────────────────────
+
             # Market close
             resp = await client.futures_create_order(
                 symbol=cfg.SYMBOL,
                 side=close_side,
                 type="MARKET",
-                quantity=pos.qty,
+                quantity=actual_qty,
                 reduceOnly=True,
             )
             actual_exit = float(resp.get("avgPrice", exit_price) or exit_price)

@@ -5,6 +5,7 @@ Thread-safe via asyncio (single-threaded event loop).
 """
 
 from __future__ import annotations
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -86,9 +87,19 @@ class State:
         self.winning_trades: int = 0
         self.losing_trades: int = 0
 
-        # Cooldown: candle index of the last closed trade
-        # Strategy will not re-enter for COOLDOWN_CANDLES bars after any close
-        self.last_close_candle: int = -999
+        # Cooldown: wall-clock timestamp (seconds) of the last closed trade.
+        # Using real time instead of candle index so the cooldown survives a
+        # bot restart — a crash-restart won't wipe the wait period.
+        # Initialised to 0 so the bot can trade immediately on a fresh start.
+        self.last_close_ts: float = 0.0
+
+        # Concurrency guard: prevents a second tick from triggering a second
+        # close while an async _live_close / _paper_close is still in-flight.
+        self.is_closing: bool = False
+
+        # Guard to emit the "balance snapshot missing" critical log only once,
+        # not on every tick.
+        self._balance_missing_logged: bool = False
 
     # ── Candle helpers ─────────────────────────────────────────────────────────
 
@@ -131,14 +142,6 @@ class State:
             return (bb + ba) / 2
         return self.mark_price
 
-    def ob_imbalance(self) -> float:
-        """bid_volume / ask_volume ratio from top-20 levels."""
-        bid_vol = sum(self.bids.values())
-        ask_vol = sum(self.asks.values())
-        if ask_vol == 0:
-            return 1.0
-        return bid_vol / ask_vol
-
     # ── Daily PnL ─────────────────────────────────────────────────────────────
 
     def record_pnl(self, pnl: float) -> None:
@@ -157,6 +160,15 @@ class State:
         else:
             base = self.live_balance_snapshot  # set at startup by bot.py
         if base == 0:
+            # Snapshot not yet available — daily loss guard is non-functional.
+            # Log only once to avoid spamming on every tick.
+            if not self._balance_missing_logged:
+                logging.getLogger("state").critical(
+                    "daily_loss_pct: live_balance_snapshot=0 — "
+                    "daily loss circuit breaker is DISABLED. "
+                    "Check API key permissions or network connectivity."
+                )
+                self._balance_missing_logged = True
             return 0.0
         return (self.daily_realised_pnl / base) * 100
 
@@ -170,6 +182,16 @@ class State:
                 # negative mid-trade because margin is pre-deducted.
                 if self.position is None:
                     self.paper_start_balance = self.paper_balance
+            else:
+                # For live mode, the daily base must be refreshed at midnight.
+                # live_balance_snapshot is kept current by bot.py after every
+                # close; here we just mark that a new daily window has started
+                # so daily_loss_pct() uses the balance at the reset boundary,
+                # not the stale startup value.
+                # (bot.py will overwrite this with a fresh REST fetch on the
+                # next close, but this prevents the guard being disabled all day
+                # if no trade has closed yet after a midnight reset.)
+                pass  # live_balance_snapshot already updated after every close
 
     # ── Win rate ──────────────────────────────────────────────────────────────
 

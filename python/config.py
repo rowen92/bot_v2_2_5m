@@ -64,10 +64,9 @@ class Config:
     PAPER_INITIAL_BALANCE: float = _float("PAPER_INITIAL_BALANCE", 1000.0)
 
     # ── Fees ───────────────────────────────────────────────────────────────────
-    # Binance USDC-pair reduced fees (screenshot: taker=0.04%, maker=0%)
-    # For regular USDT pairs set TAKER_FEE_PCT=0.05 / MAKER_FEE_PCT=0.02
+    # Only taker fee is used — all entries and exits are MARKET orders.
+    # For regular USDT pairs set TAKER_FEE_PCT=0.05
     TAKER_FEE_PCT: float = _float("TAKER_FEE_PCT", 0.04)   # % per side
-    MAKER_FEE_PCT: float = _float("MAKER_FEE_PCT", 0.0)    # % per side (USDC maker = 0)
 
     # ── Trailing Take-Profit ───────────────────────────────────────────────────
     # TRAIL_ACTIVATE_PCT: how far price must move from entry to arm the trail

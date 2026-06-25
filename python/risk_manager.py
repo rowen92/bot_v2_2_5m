@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from config import cfg
 from state import State
 
@@ -27,12 +28,14 @@ class RiskManager:
     def can_trade(self, state: State, live_balance: float | None = None) -> bool:
         """Return True if it is safe to open a new trade right now."""
 
-        # Cooldown after last trade close
-        candles_since_close = state.candle_count() - state.last_close_candle
-        if candles_since_close < cfg.COOLDOWN_CANDLES:
+        # Cooldown after last trade close — uses wall-clock time so it survives restarts.
+        # COOLDOWN_CANDLES * 60s converts candle count to seconds (assumes 1m candles).
+        cooldown_seconds = cfg.COOLDOWN_CANDLES * 60
+        seconds_since_close = time.time() - state.last_close_ts
+        if seconds_since_close < cooldown_seconds:
             log.debug(
                 f"can_trade=False  reason=cooldown  "
-                f"candles_since_close={candles_since_close}  need={cfg.COOLDOWN_CANDLES}"
+                f"seconds_since_close={seconds_since_close:.0f}  need={cooldown_seconds}"
             )
             return False
 

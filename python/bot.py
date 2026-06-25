@@ -41,7 +41,10 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
     tlog.log_signal(signal, indicators)   # log every candle (signal=none is useful too)
 
     if signal != "none":
-        if risk.can_trade(state):
+        live_bal = None
+        if not cfg.is_paper():
+            live_bal = await orders._live_balance(client)
+        if risk.can_trade(state, live_balance=live_bal):
             await orders.open_position(signal, state, client)
         else:
             log.debug(f"SIGNAL={signal.upper()} blocked by can_trade — see risk log above")
