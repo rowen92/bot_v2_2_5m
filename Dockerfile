@@ -1,28 +1,24 @@
-FROM php:8.2-cli-alpine
+FROM python:3.12-slim
 
 # Build args to match host user (avoids root-owned files on mounted volumes)
 ARG UID=1000
 ARG GID=1000
 
-# Install essential dependencies
-RUN apk add --no-cache git unzip bash curl-dev openssl-dev gmp-dev shadow
-
-# Install required PHP extensions
-RUN docker-php-ext-install curl bcmath gmp
-
-# Install Composer
-COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user matching the host UID/GID
-RUN groupmod -g ${GID} www-data 2>/dev/null || groupadd -g ${GID} appuser && \
-    usermod  -u ${UID} www-data 2>/dev/null || useradd  -u ${UID} -g ${GID} -s /bin/sh appuser
+RUN groupadd -g ${GID} appuser 2>/dev/null || true && \
+    useradd  -u ${UID} -g ${GID} -s /bin/bash -m appuser 2>/dev/null || true
 
 WORKDIR /usr/src/app
 
-# Install PHP dependencies at build time
-COPY composer.json composer.lock ./
-RUN composer install --no-interaction --no-dev --prefer-dist
+# Install Python dependencies at build time (layer-cached)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["php", "-d", "memory_limit=1024M", "./bot.php"]
+CMD ["python", "-u", "python/bot.py"]

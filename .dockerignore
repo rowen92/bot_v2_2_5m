@@ -1,0 +1,13 @@
+.env
+.git
+.gitignore
+.idea
+trades.log
+trades.*.log
+positions.log
+__pycache__
+*.pyc
+*.pyo
+.DS_Store
+Makefile
+README*

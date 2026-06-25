@@ -1,0 +1,293 @@
+from __future__ import annotations
+import logging
+import uuid
+from typing import Optional
+from binance import AsyncClient
+from config import cfg
+from risk_manager import RiskManager
+from state import Position, State
+import logger as tlog
+
+log = logging.getLogger("orders")
+rm  = RiskManager()
+
+
+class OrderManager:
+
+    # ------------------------------------------------------------------
+    # OPEN POSITION
+    # ------------------------------------------------------------------
+
+    async def open_position(
+        self,
+        signal: str,
+        state: State,
+        client: Optional[AsyncClient] = None,
+    ) -> Optional[Position]:
+        """Open a long or short futures position."""
+        entry = state.mark_price
+        if entry <= 0:
+            log.warning("open skipped: mark_price not ready")
+            return None
+
+        balance = (
+            state.paper_balance
+            if cfg.is_paper()
+            else await self._live_balance(client)
+        )
+        qty = rm.position_size(entry, balance)
+        if qty <= 0:
+            log.warning(f"open skipped: position_size=0  balance={balance:.2f}  entry={entry:.4f}")
+            return None
+        tp  = rm.tp_price(entry, signal)
+        sl  = rm.sl_price(entry, signal)
+
+        if cfg.is_paper():
+            pos = self._paper_open(signal, entry, qty, tp, sl, state)
+        else:
+            pos = await self._live_open(signal, entry, qty, tp, sl, client)
+
+        if pos:
+            pos.best_price = entry  # initialise trailing high-water-mark
+            state.position = pos
+            tlog.log_open(signal, entry, qty, tp, sl, cfg.TRADING_MODE)
+
+        return pos
+
+    # ------------------------------------------------------------------
+    # CLOSE POSITION
+    # ------------------------------------------------------------------
+
+    async def close_position(
+        self,
+        reason: str,
+        state: State,
+        client: Optional[AsyncClient] = None,
+    ) -> float:
+        """Close the current open position. Returns realised PnL in USDT."""
+        pos = state.position
+        if pos is None:
+            return 0.0
+
+        exit_price = state.mark_price
+
+        if cfg.is_paper():
+            pnl = self._paper_close(pos, exit_price, state)
+        else:
+            pnl = await self._live_close(pos, exit_price, client)
+
+        if cfg.is_paper():
+            # _paper_close already restored margin + pnl into paper_balance,
+            # so state.paper_balance now reflects the settled post-trade balance.
+            display_balance = state.paper_balance
+        else:
+            display_balance = state.live_balance_snapshot
+
+        tlog.log_close(
+            pos.side, pos.entry_price, exit_price,
+            pos.qty, pnl, reason, cfg.TRADING_MODE,
+            display_balance,
+            pos.open_time,
+        )
+        state.record_pnl(pnl)
+        state.last_close_candle = state.candle_count()   # start cooldown
+        state.position = None
+        tlog.log_daily_stats(state)
+        return pnl
+
+    # ------------------------------------------------------------------
+    # TICK CHECK  (call on every mark-price update)
+    # ------------------------------------------------------------------
+
+    async def maybe_exit(
+        self,
+        state: State,
+        client: Optional[AsyncClient] = None,
+    ) -> None:
+        """Check if TP or SL has been touched; close if so."""
+        pos = state.position
+        if pos is None:
+            return
+
+        price = state.mark_price
+        if price <= 0:
+            return
+
+        hit = None
+
+        # ── Trailing TP (takes priority over fixed TP once active) ────────────
+        if rm.update_trail(pos, price):
+            hit = "trail_tp"
+
+        # ── Fixed TP / SL (still used before trail activates) ─────────────────
+        if hit is None:
+            if pos.side == "long":
+                if not pos.trail_active and price >= pos.tp_price:
+                    hit = "tp"
+                elif price <= pos.sl_price:
+                    hit = "sl"
+            else:  # short
+                if not pos.trail_active and price <= pos.tp_price:
+                    hit = "tp"
+                elif price >= pos.sl_price:
+                    hit = "sl"
+
+        if hit:
+            await self.close_position(hit, state, client)
+
+    # ------------------------------------------------------------------
+    # PAPER HELPERS
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _paper_open(
+        signal: str, entry: float, qty: float,
+        tp: float, sl: float, state: State,
+    ) -> Position:
+        notional = entry * qty / cfg.LEVERAGE          # margin locked
+        open_fee = entry * qty * (cfg.TAKER_FEE_PCT / 100)
+        state.paper_balance -= (notional + open_fee)
+        return Position(
+            side=signal,
+            entry_price=entry,
+            qty=qty,
+            tp_price=tp,
+            sl_price=sl,
+            order_id=str(uuid.uuid4())[:8],
+            open_fee=open_fee,
+        )
+
+    @staticmethod
+    def _paper_close(pos: Position, exit_price: float, state: State) -> float:
+        if pos.side == "long":
+            raw_pnl = (exit_price - pos.entry_price) * pos.qty
+        else:
+            raw_pnl = (pos.entry_price - exit_price) * pos.qty
+        close_fee = exit_price * pos.qty * (cfg.TAKER_FEE_PCT / 100)
+
+        # True pnl includes both open and close fees — open_fee was pre-deducted
+        # from paper_balance at entry, so add it back here to keep balance correct.
+        pnl = raw_pnl - pos.open_fee - close_fee
+
+        margin = pos.entry_price * pos.qty / cfg.LEVERAGE
+        state.paper_balance += margin + pos.open_fee + pnl
+        return pnl
+
+    # ------------------------------------------------------------------
+    # LIVE HELPERS
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _live_open(
+        signal: str, entry: float, qty: float,
+        tp: float, sl: float, client: AsyncClient,
+    ) -> Optional[Position]:
+        binance_side = "BUY" if signal == "long" else "SELL"
+        close_side   = "SELL" if signal == "long" else "BUY"
+        symbol = cfg.SYMBOL
+
+        order_id     = ""
+        actual_entry = entry
+
+        try:
+            # 1. Market entry
+            resp = await client.futures_create_order(
+                symbol=symbol,
+                side=binance_side,
+                type="MARKET",
+                quantity=qty,
+            )
+            order_id     = str(resp.get("orderId", ""))
+            actual_entry = float(resp.get("avgPrice", entry) or entry)
+            if actual_entry == 0:
+                actual_entry = entry
+
+        except Exception as exc:
+            log.error(f"live_open entry failed: {exc}")
+            return None   # nothing was placed — safe to return
+
+        # Entry is now LIVE. Guard every subsequent call so we never leave a naked position.
+        try:
+            # 2. Take-profit order
+            await client.futures_create_order(
+                symbol=symbol,
+                side=close_side,
+                type="TAKE_PROFIT_MARKET",
+                stopPrice=round(rm.tp_price(actual_entry, signal), cfg.PRICE_PRECISION),
+                closePosition=True,
+                timeInForce="GTE_GTC",
+            )
+        except Exception as exc:
+            log.error(f"live_open TP placement failed — emergency close: {exc}")
+            await client.futures_create_order(
+                symbol=symbol, side=close_side, type="MARKET",
+                quantity=qty, reduceOnly=True,
+            )
+            return None
+
+        try:
+            # 3. Stop-loss order
+            await client.futures_create_order(
+                symbol=symbol,
+                side=close_side,
+                type="STOP_MARKET",
+                stopPrice=round(rm.sl_price(actual_entry, signal), cfg.PRICE_PRECISION),
+                closePosition=True,
+                timeInForce="GTE_GTC",
+            )
+        except Exception as exc:
+            log.error(f"live_open SL placement failed — emergency close: {exc}")
+            await client.futures_cancel_all_open_orders(symbol=symbol)
+            await client.futures_create_order(
+                symbol=symbol, side=close_side, type="MARKET",
+                quantity=qty, reduceOnly=True,
+            )
+            return None
+
+        return Position(
+            side=signal,
+            entry_price=actual_entry,
+            qty=qty,
+            tp_price=rm.tp_price(actual_entry, signal),
+            sl_price=rm.sl_price(actual_entry, signal),
+            order_id=order_id,
+        )
+
+    @staticmethod
+    async def _live_close(pos: Position, exit_price: float, client: AsyncClient) -> float:
+        close_side = "SELL" if pos.side == "long" else "BUY"
+        try:
+            # Cancel any open TP/SL orders first
+            await client.futures_cancel_all_open_orders(symbol=cfg.SYMBOL)
+
+            # Market close
+            resp = await client.futures_create_order(
+                symbol=cfg.SYMBOL,
+                side=close_side,
+                type="MARKET",
+                quantity=pos.qty,
+                reduceOnly=True,
+            )
+            actual_exit = float(resp.get("avgPrice", exit_price) or exit_price)
+            return rm.calc_pnl(pos.entry_price, actual_exit, pos.qty, pos.side)
+
+        except Exception as exc:
+            log.error(f"live_close failed: {exc}")
+            return 0.0
+
+    # ------------------------------------------------------------------
+    # ACCOUNT BALANCE (live only)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _live_balance(client: AsyncClient) -> float:
+        # Derive quote asset from symbol (e.g. WLDUSDT→USDT, WLDUSDC→USDC)
+        quote = cfg.SYMBOL[-4:] if cfg.SYMBOL.endswith(("USDT", "USDC", "BUSD")) else "USDT"
+        try:
+            balances = await client.futures_account_balance()
+            for b in balances:
+                if b["asset"] == quote:
+                    return float(b["availableBalance"])
+        except Exception as exc:
+            log.error(f"balance fetch failed: {exc}")
+        return 0.0
