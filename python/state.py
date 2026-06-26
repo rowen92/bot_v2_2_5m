@@ -178,9 +178,17 @@ class State:
             self.daily_realised_pnl = 0.0
             self.daily_reset_ts = now
             if cfg.is_paper():
-                # Only snapshot the balance when flat — paper_balance is
-                # negative mid-trade because margin is pre-deducted.
-                if self.position is None:
+                # Snapshot settled balance as the new daily base.
+                # If a position is open at midnight, paper_balance has margin
+                # pre-deducted, so reconstruct the settled equivalent:
+                #   settled ≈ paper_balance + locked_margin + open_fee
+                if self.position is not None:
+                    locked_margin = (
+                        self.position.entry_price * self.position.qty / cfg.LEVERAGE
+                    )
+                    settled_approx = self.paper_balance + locked_margin + self.position.open_fee
+                    self.paper_start_balance = settled_approx
+                else:
                     self.paper_start_balance = self.paper_balance
             else:
                 # For live mode, the daily base must be refreshed at midnight.

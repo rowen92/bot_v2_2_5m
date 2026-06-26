@@ -83,6 +83,13 @@ class Config:
     ATR_MAX_MULT: float     = _float("ATR_MAX_MULT", 1.8)      # reject spike candles
     VOLUME_MIN_MULT: float  = _float("VOLUME_MIN_MULT", 0.6)   # dead-market filter
 
+    # ── Post-panic recovery filter ─────────────────────────────────────────────
+    # Suppresses OI-falling SHORT signals during short-covering rallies after a flush.
+    # PANIC_VOL_MULT: candle volume must be this many × avg to count as a panic flush
+    # POST_PANIC_BARS: how many bars after the panic to remain in suppression mode
+    PANIC_VOL_MULT: float   = _float("PANIC_VOL_MULT", 4.0)
+    POST_PANIC_BARS: int    = _int("POST_PANIC_BARS", 20)
+
     # ── Symbol precision ───────────────────────────────────────────────────────
     # Qty step size for the traded symbol (Binance lot size filter)
     # WLDUSDT=0.1  BTCUSDT=0.001  ETHUSDT=0.01  SOLUSDT=0.1

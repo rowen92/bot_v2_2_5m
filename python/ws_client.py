@@ -127,14 +127,21 @@ async def run_streams(
         f"  markPrice: {mark_stream}  (OI via REST per candle)"
     )
 
+    last_processed_open_time = 0  # tracks last candle we ran on_closed_candle for
+
     async def handle_kline(data: dict) -> None:
+        nonlocal last_processed_open_time
         # Capture whether the *previous* live candle was already closed before
         # we parse this message. The callback fires only on the transition
         # open→closed, not on every tick of an already-closed candle.
         prev_closed = state.live_candle is not None and state.live_candle.is_closed
         _parse_kline(data, state)
         just_closed = state.live_candle is not None and state.live_candle.is_closed
-        if just_closed and not prev_closed:
+        # Guard against WS reconnect replaying the last closed candle — only
+        # fire on_closed_candle once per unique open_time.
+        candle_open_time = state.live_candle.open_time if state.live_candle else 0
+        if just_closed and not prev_closed and candle_open_time != last_processed_open_time:
+            last_processed_open_time = candle_open_time
             await on_closed_candle(state)
 
     async def handle_depth(data: dict) -> None:

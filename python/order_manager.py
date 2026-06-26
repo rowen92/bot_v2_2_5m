@@ -78,7 +78,16 @@ class OrderManager:
         if cfg.is_paper():
             pnl = self._paper_close(pos, exit_price, state)
         else:
-            pnl = await self._live_close(pos, exit_price, client)
+            result = await self._live_close(pos, exit_price, client)
+            # _live_close returns None only on exception — position may still be
+            # open on Binance. Keep state.position intact so the next tick retries.
+            if result is None:
+                log.error(
+                    f"live_close failed — keeping position open in state to retry.  "
+                    f"side={pos.side}  entry={pos.entry_price:.4f}  qty={pos.qty}"
+                )
+                return 0.0
+            pnl = result
 
         if cfg.is_paper():
             # _paper_close already restored margin + pnl into paper_balance,
@@ -287,7 +296,12 @@ class OrderManager:
         )
 
     @staticmethod
-    async def _live_close(pos: Position, exit_price: float, client: AsyncClient) -> float:
+    async def _live_close(pos: Position, exit_price: float, client: AsyncClient) -> float | None:
+        """
+        Returns the realised PnL (float) on success, or None on failure.
+        Returning None (not 0.0) lets the caller distinguish a failed close
+        from a legitimate breakeven trade.
+        """
         close_side = "SELL" if pos.side == "long" else "BUY"
         try:
             # Cancel any open TP/SL orders first
@@ -329,7 +343,7 @@ class OrderManager:
 
         except Exception as exc:
             log.error(f"live_close failed: {exc}")
-            return 0.0
+            return None  # sentinel: caller must NOT clear state.position
 
     # ------------------------------------------------------------------
     # ACCOUNT BALANCE (live only)

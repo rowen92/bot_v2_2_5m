@@ -91,8 +91,12 @@ class RiskManager:
         if sl_distance == 0:
             return 0.0
 
-        notional = risk_usdt * cfg.LEVERAGE   # effective buying power at risk
-        qty      = notional / sl_distance
+        # risk_usdt is the dollar amount we are willing to lose if SL is hit.
+        # sl_distance is the loss-per-unit if price moves to SL.
+        # qty = risk_usdt / sl_distance gives the correct unlevered size.
+        # Leverage is implicitly applied by the exchange on the margin side —
+        # do NOT multiply here or the position becomes leverage× too large.
+        qty = risk_usdt / sl_distance
 
         # Round down to nearest QTY_STEP (configured per symbol in .env).
         # Use math.floor(round(...)) to avoid float precision errors where

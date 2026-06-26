@@ -15,7 +15,7 @@ Pattern observed on chart (the "squares"):
          ▸ Candle range < ATR * ATR_MAX_MULT    (spike filter)
          ▸ Volume ≥ avg_volume * VOLUME_MIN_MULT (dead-market filter)
 
-  SHORT ▸ mirror — near swing HIGH, bearish close, OI rising
+  SHORT ▸ near swing HIGH, bearish close, OI rising (new shorts) OR OI falling (long liquidation)
 
   Returns 'long' | 'short' | 'none'
 """
@@ -83,21 +83,27 @@ class ScalpingStrategy:
         # Rolling window for OI mean filter
         self._oi_mean_bars = cfg.OI_MEAN_BARS          # e.g. 20
 
-        # Per-candle cache
-        self._cache_count: int   = -1
+        # Per-candle cache — keyed on last candle open_time so the cache is
+        # refreshed on every new candle even when the deque is at maxlen (200).
+        self._cache_key: int     = -1   # last candle open_time
         self._cache_df           = None
         self._cache_atr: float   = 0.0
 
     # ──────────────────────────────────────────────────────────────────────────
 
     def _refresh_cache(self, state: State) -> None:
-        """Rebuild the per-candle DataFrame + ATR cache if the candle count changed."""
-        candle_count = state.candle_count()
-        if self._cache_count != candle_count:
+        """Rebuild the per-candle DataFrame + ATR cache when the latest candle changes.
+
+        Uses the last candle's open_time as the cache key instead of the deque
+        length, so the cache is always refreshed on a new candle even when the
+        buffer is at maxlen (200) and candle_count() returns the same value.
+        """
+        last_open_time = state._candles[-1].open_time if state._candles else -1
+        if self._cache_key != last_open_time:
             df                = state.to_dataframe()
             self._cache_atr   = _atr(df, self.atr_period)
             self._cache_df    = df
-            self._cache_count = candle_count
+            self._cache_key   = last_open_time
 
     def get_signal(self, state: State) -> str:
         """
@@ -167,23 +173,40 @@ class ScalpingStrategy:
             )
             return "long"
 
-        # ── SHORT: touch swing high + bearish reversal candle + OI rising ─────
-        if near_high and is_bearish and oi_rising and oi_above_mean:
+        # ── SHORT: touch swing high ────────────────────────────────────────────
+        # Body and OI requirements are asymmetric by setup type:
+        #
+        #   OI rising  → reversal short: new shorts piling in at the high
+        #                needs bearish body (red candle) to confirm seller conviction
+        #                needs oi_above_mean: real accumulation of short interest
+        #
+        #   OI falling → trend continuation short: longs unwinding / liquidating
+        #                a GREEN retest candle is actually the signal — weak buyers
+        #                retesting broken support-turned-resistance with no follow-through
+        #                body direction is irrelevant; oi_above_mean relaxed (OI drains in downtrend)
+        oi_falling = self._oi_is_falling(state)
+        oi_confirms_short = oi_rising or oi_falling
+        short_mean_ok  = oi_above_mean if oi_rising else True
+        short_body_ok  = is_bearish    if oi_rising else True  # green retest is valid for liquidation short
+        if near_high and short_body_ok and oi_confirms_short and short_mean_ok:
             log.debug(
                 f"SHORT signal  close={last_close:.4f}  swing_high={swing_high:.4f}"
-                f"  touch_dist={touch_dist:.4f}  oi_rising={oi_rising}"
+                f"  touch_dist={touch_dist:.4f}  oi_rising={oi_rising}  oi_falling={oi_falling}"
             )
             return "short"
 
         # ── Debug: log what was close but blocked ──────────────────────────────
         if near_low or near_high:
-            direction  = "LONG_CAND" if near_low else "SHORT_CAND"
-            body_ok    = is_bullish if near_low else is_bearish
-            reasons = []
-            if not body_ok:
+            direction = "LONG_CAND" if near_low else "SHORT_CAND"
+            reasons   = []
+            if near_low and not is_bullish:
                 reasons.append("no_reversal_body")
-            if not oi_rising:
+            if near_high and oi_rising and not is_bearish:
+                reasons.append("no_reversal_body(reversal_short_needs_red_candle)")
+            if near_low and not oi_rising:
                 reasons.append(f"oi_not_rising(last {self._oi_bars} bars)")
+            if near_high and not oi_confirms_short:
+                reasons.append(f"oi_not_rising_or_falling(last {self._oi_bars} bars)")
             if not oi_above_mean:
                 reasons.append(f"oi_below_mean({self._oi_mean_bars}bar avg)")
             if reasons:
@@ -225,6 +248,64 @@ class ScalpingStrategy:
         mean_oi    = sum(window) / len(window)
         latest_oi  = history[-1]
         return latest_oi >= mean_oi
+
+    def _oi_is_falling(self, state: State) -> bool:
+        """
+        Return True if OI has been consistently falling over the last
+        OI_CONFIRM_BARS readings — indicates long liquidation / unwinding.
+        Mirror of _oi_is_rising; used to confirm SHORT entries during downtrends
+        where longs exit rather than new shorts enter (OI drops, not rises).
+
+        IMPORTANT: Returns False if we are in a post-panic recovery phase.
+        After a panic flush, OI falling = SHORT COVERING (bullish), not
+        long liquidation (bearish). Shorting into short-covering is the
+        opposite of the intended signal.
+        """
+        history = state.oi_history
+        if len(history) < self._oi_bars + 1:
+            return False
+        window = list(history)[-(self._oi_bars + 1):]
+        is_falling = all(window[i] <= window[i - 1] for i in range(1, len(window)))
+        if is_falling and self._in_post_panic_recovery(state):
+            log.debug("OI falling but post-panic recovery detected — SHORT suppressed")
+            return False
+        return is_falling
+
+    def _in_post_panic_recovery(self, state: State) -> bool:
+        """
+        Detect if we are in a short-covering recovery phase after a panic flush.
+
+        Conditions (all must be true):
+          1. A panic candle occurred within the last POST_PANIC_BARS candles
+             (vol > avg_vol * PANIC_VOL_MULT, e.g. 4× average)
+          2. Price is ABOVE the panic candle's close (recovering, not continuing down)
+          3. OI is still elevated vs pre-panic level (shorts haven't fully covered yet)
+
+        When this returns True, OI falling means shorts covering → bullish, not bearish.
+        """
+        df = self._cache_df
+        if df is None or len(df) < cfg.POST_PANIC_BARS + 5:
+            return False
+
+        vol   = df["volume"]
+        close = df["close"]
+        avg_vol = float(vol.iloc[-40:].mean()) if len(vol) >= 40 else float(vol.mean())
+        panic_threshold = avg_vol * cfg.PANIC_VOL_MULT
+
+        # Scan the last POST_PANIC_BARS candles for a panic candle
+        lookback = min(cfg.POST_PANIC_BARS, len(df) - 1)
+        recent_vol   = vol.iloc[-(lookback + 1):-1]
+        recent_close = close.iloc[-(lookback + 1):-1]
+        current_close = float(close.iloc[-1])
+
+        for i in range(len(recent_vol)):
+            if float(recent_vol.iloc[i]) >= panic_threshold:
+                panic_close = float(recent_close.iloc[i])
+                # Price has recovered above the panic close = short-covering rally
+                if current_close > panic_close:
+                    return True
+
+        return False
 
     # ──────────────────────────────────────────────────────────────────────────
 
