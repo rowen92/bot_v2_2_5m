@@ -1,13 +1,24 @@
 vendor/
 composer.lock
+
+# Secrets — never commit
 .env
+# Template is committed
+!.env.default
+
+# Auto-generated — edit docker-compose.template.yml instead
+docker-compose.yml
+
+# Runtime state & logs
 trades.log
 trades.*.log
 positions.log
-.idea/
 bot_state.json
 
-# Python bytecode — never commit these
+# IDE
+.idea/
+
+# Python bytecode
 __pycache__/
 *.pyc
 *.pyo
