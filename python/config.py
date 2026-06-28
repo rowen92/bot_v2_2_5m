@@ -46,10 +46,12 @@ class Config:
     LEVERAGE: int        = _int("LEVERAGE", 10)
     MARGIN_TYPE: str     = os.getenv("MARGIN_TYPE", "ISOLATED").upper()
 
-    # ── Strategy: Structure-reversal + Open Interest ───────────────────────────
-    # How many bars back to look for the swing high / swing low
+    # ── Strategy: Break & Retest + Open Interest ──────────────────────────────
+    # How many recent bars to scan for the breakout candle
     SWING_LOOKBACK: int          = _int("SWING_LOOKBACK", 10)
-    # Max distance from swing level (in ATR units) that still counts as a "touch"
+    # How many bars before the breakout to measure the prior swing level
+    BREAK_LOOKBACK: int          = _int("BREAK_LOOKBACK", 20)
+    # Max distance from the broken level (in ATR units) that counts as a retest touch
     STRUCTURE_TOUCH_ATR: float   = _float("STRUCTURE_TOUCH_ATR", 0.5)
     # How many consecutive OI readings must be rising to confirm entry
     OI_CONFIRM_BARS: int         = _int("OI_CONFIRM_BARS", 3)

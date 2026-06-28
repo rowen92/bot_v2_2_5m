@@ -1,21 +1,26 @@
 """
-strategy.py – Structure-reversal scalping signal generator.
+strategy.py – Break & Retest scalping signal generator.
 
-Pattern observed on chart (the "squares"):
-  ── Price forms a clear swing LOW or swing HIGH (structure level)
-  ── Open Interest is RISING  → real money entering, not just liquidations
-  ── The reversal candle closes in the direction of the trade (bullish/bearish body)
+Pattern:
+  ── Price breaks (closes) above a prior SWING HIGH  → the old resistance becomes support
+  ── Price pulls back and retests that broken level (within STRUCTURE_TOUCH_ATR * ATR)
+  ── A bullish confirmation candle (close > open) forms at the retest zone
+  ── OI is rising (real money entering, not just liquidations) and above its mean
   ── No volatility spike (range < ATR * ATR_MAX_MULT)
   ── Volume is not abnormally low (dead-market filter)
 
-  LONG  ▸ Current close is near (≤ STRUCTURE_TOUCH_ATR * ATR) above the N-bar swing low
-         ▸ Current candle is a bullish close  (close > open)
-         ▸ Open Interest has increased over the last OI_CONFIRM_BARS candles
-         ▸ OI absolute level is above its rolling mean (OI_MEAN_BARS) → trend of accumulation
+  LONG  ▸ A candle within the last SWING_LOOKBACK bars CLOSED above the prior BREAK_LOOKBACK swing high
+         ▸ Current price has pulled back to within STRUCTURE_TOUCH_ATR * ATR of that broken high
+         ▸ Current candle is a bullish close (bounce off the retested level)
+         ▸ OI has increased over the last OI_CONFIRM_BARS candles
+         ▸ OI absolute level is above its rolling mean (OI_MEAN_BARS)
          ▸ Candle range < ATR * ATR_MAX_MULT    (spike filter)
          ▸ Volume ≥ avg_volume * VOLUME_MIN_MULT (dead-market filter)
 
-  SHORT ▸ near swing HIGH, bearish close, OI rising (new shorts) OR OI falling (long liquidation)
+  SHORT ▸ A candle within the last SWING_LOOKBACK bars CLOSED below the prior BREAK_LOOKBACK swing low
+         ▸ Current price has pulled back (up) to within STRUCTURE_TOUCH_ATR * ATR of that broken low
+         ▸ Current candle is bearish (OI rising) OR any body (OI falling = long liquidation)
+         ▸ OI confirms (rising = new shorts entering; falling = longs liquidating)
 
   Returns 'long' | 'short' | 'none'
 """
@@ -23,6 +28,7 @@ Pattern observed on chart (the "squares"):
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 import pandas as pd
 
@@ -48,25 +54,80 @@ def _atr(df: pd.DataFrame, period: int) -> float:
     return float(tr.ewm(com=period - 1, adjust=False).mean().iloc[-1])
 
 
-def _swing_low(low: pd.Series, lookback: int) -> float:
-    """Lowest low over the last `lookback` candles (excluding current bar)."""
-    window = low.iloc[-(lookback + 1):-1]
-    return float(window.min())
+def _find_broken_resistance(df: pd.DataFrame, swing_bars: int, break_lookback: int) -> Optional[float]:
+    """
+    Scan the last `swing_bars` closed candles (excluding current) for a breakout candle
+    — i.e. a candle whose CLOSE exceeded the swing high of the `break_lookback` bars
+    that preceded it.
+
+    Returns the broken resistance level (old swing high) if found, else None.
+
+    The returned level is what price should now retest from above (as support).
+    """
+    n = len(df)
+    # We need at least break_lookback + swing_bars + 1 rows
+    if n < break_lookback + swing_bars + 1:
+        return None
+
+    # Scan the last swing_bars candles (excluding the current candle at -1)
+    for offset in range(1, swing_bars + 1):
+        # Index of the candidate breakout candle
+        break_idx = n - 1 - offset
+        if break_idx < break_lookback:
+            break
+
+        candidate_close = float(df["close"].iloc[break_idx])
+        # Swing high of the bars BEFORE the breakout candle
+        pre_break_high = float(df["high"].iloc[break_idx - break_lookback: break_idx].max())
+
+        if candidate_close > pre_break_high:
+            return pre_break_high  # the broken resistance = retest support
+
+    return None
 
 
-def _swing_high(high: pd.Series, lookback: int) -> float:
-    """Highest high over the last `lookback` candles (excluding current bar)."""
-    window = high.iloc[-(lookback + 1):-1]
-    return float(window.max())
+def _find_broken_support(df: pd.DataFrame, swing_bars: int, break_lookback: int) -> Optional[float]:
+    """
+    Mirror of _find_broken_resistance for SHORT setups.
+
+    Scans the last `swing_bars` candles for one whose CLOSE broke below the
+    swing low of the preceding `break_lookback` bars.
+
+    Returns the broken support level (old swing low) if found — this is the
+    level price should retest from below (as resistance). Returns None otherwise.
+    """
+    n = len(df)
+    if n < break_lookback + swing_bars + 1:
+        return None
+
+    for offset in range(1, swing_bars + 1):
+        break_idx = n - 1 - offset
+        if break_idx < break_lookback:
+            break
+
+        candidate_close = float(df["close"].iloc[break_idx])
+        pre_break_low   = float(df["low"].iloc[break_idx - break_lookback: break_idx].min())
+
+        if candidate_close < pre_break_low:
+            return pre_break_low  # the broken support = retest resistance
+
+    return None
 
 
 # ── Strategy ───────────────────────────────────────────────────────────────────
 
 class ScalpingStrategy:
     """
-    Reversal-at-structure scalper using Open Interest + price action.
-    No EMA crossovers — entries happen at swing lows / swing highs
-    when OI confirms that real money is stepping in.
+    Break & Retest scalper using price action + Open Interest confirmation.
+
+    Entry logic:
+      LONG  — a recent candle broke (closed above) a swing high.
+              Price has now pulled back to retest that old level from above.
+              A bullish confirmation candle fires the entry.
+
+      SHORT — a recent candle broke (closed below) a swing low.
+              Price has now pulled back (bounced up) to retest that old level from below.
+              A bearish (or any, if OI is falling) candle fires the entry.
     """
 
     def __init__(self):
@@ -74,43 +135,39 @@ class ScalpingStrategy:
         self.atr_max       = cfg.ATR_MAX_MULT
         self.vol_min       = cfg.VOLUME_MIN_MULT
 
-        # How many bars to look back when finding the swing level
-        self._swing_bars   = cfg.SWING_LOOKBACK        # e.g. 10
-        # How close (in ATR units) to the swing level counts as a "touch"
-        self._touch_mult   = cfg.STRUCTURE_TOUCH_ATR   # e.g. 0.5
-        # How many OI readings must be rising consecutively
-        self._oi_bars      = cfg.OI_CONFIRM_BARS       # e.g. 3
+        # How many recent bars to scan for the breakout candle
+        self._swing_bars    = cfg.SWING_LOOKBACK        # e.g. 10
+        # How many bars before the breakout to measure the prior swing level
+        self._break_bars    = cfg.BREAK_LOOKBACK        # e.g. 20
+        # How close (in ATR units) the retest must be to the broken level
+        self._touch_mult    = cfg.STRUCTURE_TOUCH_ATR   # e.g. 0.5
+        # How many consecutive OI readings must be rising/falling to confirm
+        self._oi_bars       = cfg.OI_CONFIRM_BARS       # e.g. 3
         # Rolling window for OI mean filter
-        self._oi_mean_bars = cfg.OI_MEAN_BARS          # e.g. 20
+        self._oi_mean_bars  = cfg.OI_MEAN_BARS          # e.g. 20
 
-        # Per-candle cache — keyed on last candle open_time so the cache is
-        # refreshed on every new candle even when the deque is at maxlen (200).
-        self._cache_key: int     = -1   # last candle open_time
-        self._cache_df           = None
-        self._cache_atr: float   = 0.0
+        # Per-candle cache — refreshed when open_time changes
+        self._cache_key: int   = -1
+        self._cache_df         = None
+        self._cache_atr: float = 0.0
 
     # ──────────────────────────────────────────────────────────────────────────
 
     def _refresh_cache(self, state: State) -> None:
-        """Rebuild the per-candle DataFrame + ATR cache when the latest candle changes.
-
-        Uses the last candle's open_time as the cache key instead of the deque
-        length, so the cache is always refreshed on a new candle even when the
-        buffer is at maxlen (200) and candle_count() returns the same value.
-        """
+        """Rebuild DataFrame + ATR cache on each new closed candle."""
         last_open_time = state._candles[-1].open_time if state._candles else -1
         if self._cache_key != last_open_time:
-            df                = state.to_dataframe()
-            self._cache_atr   = _atr(df, self.atr_period)
-            self._cache_df    = df
-            self._cache_key   = last_open_time
+            df              = state.to_dataframe()
+            self._cache_atr = _atr(df, self.atr_period)
+            self._cache_df  = df
+            self._cache_key = last_open_time
 
     def get_signal(self, state: State) -> str:
         """
-        Evaluate the current closed candle and OI history.
+        Evaluate the current closed candle for a Break & Retest setup.
         Returns 'long', 'short', or 'none'.
         """
-        min_bars = self._swing_bars + self.atr_period + 5
+        min_bars = self._break_bars + self._swing_bars + self.atr_period + 5
         if state.candle_count() < min_bars:
             return "none"
 
@@ -127,11 +184,12 @@ class ScalpingStrategy:
 
         last_close = float(close.iloc[-1])
         last_open  = float(open_.iloc[-1])
-        last_range = float(high.iloc[-1] - low.iloc[-1])
+        last_high  = float(high.iloc[-1])
+        last_low   = float(low.iloc[-1])
+        last_range = last_high - last_low
 
-        # ── Filters shared by both directions ──────────────────────────────────
+        # ── Shared filters ─────────────────────────────────────────────────────
         is_spike = last_range > atr * self.atr_max
-
         avg_vol       = float(vol.iloc[-20:].mean()) if len(vol) >= 20 else float(vol.mean())
         enough_volume = float(vol.iloc[-1]) >= avg_vol * self.vol_min
 
@@ -142,146 +200,126 @@ class ScalpingStrategy:
                 log.debug(f"LOW_VOL filtered  vol={float(vol.iloc[-1]):.1f}  need={avg_vol*self.vol_min:.1f}")
             return "none"
 
-        # ── Open Interest check ────────────────────────────────────────────────
-        oi_rising  = self._oi_is_rising(state)
+        # ── OI checks ──────────────────────────────────────────────────────────
+        oi_rising     = self._oi_is_rising(state)
+        oi_falling    = self._oi_is_falling(state)
         oi_above_mean = self._oi_above_mean(state)
 
-        # ── Swing structure levels ─────────────────────────────────────────────
-        touch_dist  = atr * self._touch_mult
-        swing_low   = _swing_low(low, self._swing_bars)
-        swing_high  = _swing_high(high, self._swing_bars)
+        touch_dist = atr * self._touch_mult
+        is_bullish = last_close > last_open
+        is_bearish = last_close < last_open
 
-        # Near swing low: price dipped within touch_dist of the swing low
-        near_low  = float(low.iloc[-1]) <= swing_low + touch_dist
-        # Near swing high: price pushed within touch_dist of the swing high
-        near_high = float(high.iloc[-1]) >= swing_high - touch_dist
+        # ── LONG: Break & Retest of a prior resistance ─────────────────────────
+        # 1. A breakout candle closed above the prior swing high within SWING_LOOKBACK bars
+        # 2. Current candle retests that old high from above (within touch_dist)
+        # 3. Bullish confirmation body (green candle bouncing off the level)
+        # 4. OI rising + above mean
 
-        # If candle touches BOTH levels it swept the whole range — too chaotic, skip
-        if near_low and near_high:
-            log.debug(f"SWEEP candle — touches both swing_low={swing_low:.4f} and swing_high={swing_high:.4f}, skipping")
-            return "none"
-
-        # Candle body direction
-        is_bullish = last_close > last_open  # green candle
-        is_bearish = last_close < last_open  # red candle
-
-        # ── LONG: touch swing low + bullish reversal candle + OI rising ───────
-        if near_low and is_bullish and oi_rising and oi_above_mean:
-            log.debug(
-                f"LONG signal  close={last_close:.4f}  swing_low={swing_low:.4f}"
-                f"  touch_dist={touch_dist:.4f}  oi_rising={oi_rising}"
+        broken_resistance = _find_broken_resistance(df, self._swing_bars, self._break_bars)
+        if broken_resistance is not None:
+            # Retest: current low dips to within touch_dist above the broken level
+            # and current close stays above it (confirmed hold)
+            at_retest_long = (
+                last_low  <= broken_resistance + touch_dist and
+                last_close >= broken_resistance - touch_dist
             )
-            return "long"
+            if at_retest_long and is_bullish and oi_rising and oi_above_mean:
+                log.debug(
+                    f"LONG B&R  close={last_close:.4f}  broken_res={broken_resistance:.4f}"
+                    f"  touch_dist={touch_dist:.4f}  oi_rising={oi_rising}"
+                )
+                return "long"
+            elif at_retest_long:
+                reasons = []
+                if not is_bullish:      reasons.append("no_bullish_body")
+                if not oi_rising:       reasons.append(f"oi_not_rising({self._oi_bars}bars)")
+                if not oi_above_mean:   reasons.append(f"oi_below_mean({self._oi_mean_bars}bar)")
+                log.debug(f"BLOCKED LONG_B&R  broken_res={broken_resistance:.4f}  " + "  ".join(reasons))
 
-        # ── SHORT: touch swing high ────────────────────────────────────────────
-        # Body and OI requirements are asymmetric by setup type:
-        #
-        #   OI rising  → reversal short: new shorts piling in at the high
-        #                needs bearish body (red candle) to confirm seller conviction
-        #                needs oi_above_mean: real accumulation of short interest
-        #
-        #   OI falling → trend continuation short: longs unwinding / liquidating
-        #                a GREEN retest candle is actually the signal — weak buyers
-        #                retesting broken support-turned-resistance with no follow-through
-        #                body direction is irrelevant; oi_above_mean relaxed (OI drains in downtrend)
-        oi_falling = self._oi_is_falling(state)
-        oi_confirms_short = oi_rising or oi_falling
-        short_mean_ok  = oi_above_mean if oi_rising else True
-        short_body_ok  = is_bearish    if oi_rising else True  # green retest is valid for liquidation short
-        if near_high and short_body_ok and oi_confirms_short and short_mean_ok:
-            log.debug(
-                f"SHORT signal  close={last_close:.4f}  swing_high={swing_high:.4f}"
-                f"  touch_dist={touch_dist:.4f}  oi_rising={oi_rising}  oi_falling={oi_falling}"
+        # ── SHORT: Break & Retest of a prior support ───────────────────────────
+        # 1. A breakdown candle closed below the prior swing low within SWING_LOOKBACK bars
+        # 2. Current candle bounces up to retest that old low from below (within touch_dist)
+        # 3. Bearish confirmation (if OI rising = new shorts) OR any body (if OI falling = long liq)
+        # 4. OI confirms (rising or falling)
+
+        broken_support = _find_broken_support(df, self._swing_bars, self._break_bars)
+        if broken_support is not None:
+            # Retest from below: current high pushes up to within touch_dist of broken level
+            # and current close stays below it (confirmed rejection)
+            at_retest_short = (
+                last_high  >= broken_support - touch_dist and
+                last_close <= broken_support + touch_dist
             )
-            return "short"
+            oi_confirms_short = oi_rising or oi_falling
+            short_mean_ok     = oi_above_mean if oi_rising else True
+            short_body_ok     = is_bearish    if oi_rising else True
 
-        # ── Debug: log what was close but blocked ──────────────────────────────
-        if near_low or near_high:
-            direction = "LONG_CAND" if near_low else "SHORT_CAND"
-            reasons   = []
-            if near_low and not is_bullish:
-                reasons.append("no_reversal_body")
-            if near_high and oi_rising and not is_bearish:
-                reasons.append("no_reversal_body(reversal_short_needs_red_candle)")
-            if near_low and not oi_rising:
-                reasons.append(f"oi_not_rising(last {self._oi_bars} bars)")
-            if near_high and not oi_confirms_short:
-                reasons.append(f"oi_not_rising_or_falling(last {self._oi_bars} bars)")
-            if not oi_above_mean:
-                reasons.append(f"oi_below_mean({self._oi_mean_bars}bar avg)")
-            if reasons:
-                log.debug(f"BLOCKED {direction}  " + "  ".join(reasons))
+            if at_retest_short and short_body_ok and oi_confirms_short and short_mean_ok:
+                log.debug(
+                    f"SHORT B&R  close={last_close:.4f}  broken_sup={broken_support:.4f}"
+                    f"  touch_dist={touch_dist:.4f}  oi_rising={oi_rising}  oi_falling={oi_falling}"
+                )
+                return "short"
+            elif at_retest_short:
+                reasons = []
+                if oi_rising and not is_bearish:    reasons.append("no_bearish_body(reversal_short)")
+                if not oi_confirms_short:            reasons.append(f"oi_not_rising_or_falling({self._oi_bars}bars)")
+                if oi_rising and not oi_above_mean:  reasons.append(f"oi_below_mean({self._oi_mean_bars}bar)")
+                log.debug(f"BLOCKED SHORT_B&R  broken_sup={broken_support:.4f}  " + "  ".join(reasons))
 
         return "none"
 
     # ──────────────────────────────────────────────────────────────────────────
 
     def _oi_is_rising(self, state: State) -> bool:
-        """
-        Return True if OI has been consistently rising over the last
-        OI_CONFIRM_BARS readings.
-        Requires at least OI_CONFIRM_BARS + 1 readings in the buffer.
-        """
+        """Return True if OI has risen consecutively over the last OI_CONFIRM_BARS readings."""
         history = state.oi_history
         if len(history) < self._oi_bars + 1:
             log.debug("OI history too short — skipping trade")
             return False
-        # Check last N consecutive readings are each >= previous
-        window = list(history)[-( self._oi_bars + 1):]
+        window = list(history)[-(self._oi_bars + 1):]
         return all(window[i] >= window[i - 1] for i in range(1, len(window)))
 
     def _oi_above_mean(self, state: State) -> bool:
-        """
-        Return True if the latest OI reading is above the rolling mean
-        of the last OI_MEAN_BARS readings (avoids trading into OI drain).
-        Requires at least OI_MEAN_BARS readings — returns False (blocking)
-        until enough data is collected, same conservative stance as _oi_is_rising.
-        """
+        """Return True if the latest OI reading is above the rolling OI_MEAN_BARS mean."""
         history = state.oi_history
         if len(history) < self._oi_mean_bars:
             log.debug(
                 f"OI mean filter: not enough data "
                 f"({len(history)}/{self._oi_mean_bars}) — blocking trade"
             )
-            return False  # conservative: don't trade without enough OI history
-        window     = list(history)[-(self._oi_mean_bars):]
-        mean_oi    = sum(window) / len(window)
-        latest_oi  = history[-1]
-        return latest_oi >= mean_oi
+            return False
+        window   = list(history)[-(self._oi_mean_bars):]
+        mean_oi  = sum(window) / len(window)
+        return history[-1] >= mean_oi
 
     def _oi_is_falling(self, state: State) -> bool:
         """
         Return True if OI has been consistently falling over the last
         OI_CONFIRM_BARS readings — indicates long liquidation / unwinding.
-        Mirror of _oi_is_rising; used to confirm SHORT entries during downtrends
-        where longs exit rather than new shorts enter (OI drops, not rises).
 
-        IMPORTANT: Returns False if we are in a post-panic recovery phase.
-        After a panic flush, OI falling = SHORT COVERING (bullish), not
-        long liquidation (bearish). Shorting into short-covering is the
-        opposite of the intended signal.
+        Returns False during a post-panic short-covering recovery so we don't
+        mistake shorts covering (bullish) for longs liquidating (bearish).
         """
         history = state.oi_history
         if len(history) < self._oi_bars + 1:
             return False
         window = list(history)[-(self._oi_bars + 1):]
         is_falling = all(window[i] <= window[i - 1] for i in range(1, len(window)))
-        if is_falling and self._in_post_panic_recovery(state):
+        if is_falling and self._in_post_panic_recovery():
             log.debug("OI falling but post-panic recovery detected — SHORT suppressed")
             return False
         return is_falling
 
-    def _in_post_panic_recovery(self, state: State) -> bool:
+    def _in_post_panic_recovery(self) -> bool:
         """
-        Detect if we are in a short-covering recovery phase after a panic flush.
+        Detect a short-covering rally after a panic flush.
 
-        Conditions (all must be true):
-          1. A panic candle occurred within the last POST_PANIC_BARS candles
-             (vol > avg_vol * PANIC_VOL_MULT, e.g. 4× average)
-          2. Price is ABOVE the panic candle's close (recovering, not continuing down)
-          3. OI is still elevated vs pre-panic level (shorts haven't fully covered yet)
+        Conditions (all must hold):
+          1. A panic candle (vol > avg_vol * PANIC_VOL_MULT) within the last POST_PANIC_BARS bars
+          2. Current price is ABOVE that panic candle's close (recovering, not continuing down)
 
-        When this returns True, OI falling means shorts covering → bullish, not bearish.
+        When True, OI falling = shorts covering → bullish signal, not a SHORT trigger.
         """
         df = self._cache_df
         if df is None or len(df) < cfg.POST_PANIC_BARS + 5:
@@ -289,22 +327,18 @@ class ScalpingStrategy:
 
         vol   = df["volume"]
         close = df["close"]
-        avg_vol = float(vol.iloc[-40:].mean()) if len(vol) >= 40 else float(vol.mean())
+        avg_vol         = float(vol.iloc[-40:].mean()) if len(vol) >= 40 else float(vol.mean())
         panic_threshold = avg_vol * cfg.PANIC_VOL_MULT
 
-        # Scan the last POST_PANIC_BARS candles for a panic candle
-        lookback = min(cfg.POST_PANIC_BARS, len(df) - 1)
-        recent_vol   = vol.iloc[-(lookback + 1):-1]
-        recent_close = close.iloc[-(lookback + 1):-1]
+        lookback      = min(cfg.POST_PANIC_BARS, len(df) - 1)
+        recent_vol    = vol.iloc[-(lookback + 1):-1]
+        recent_close  = close.iloc[-(lookback + 1):-1]
         current_close = float(close.iloc[-1])
 
         for i in range(len(recent_vol)):
             if float(recent_vol.iloc[i]) >= panic_threshold:
-                panic_close = float(recent_close.iloc[i])
-                # Price has recovered above the panic close = short-covering rally
-                if current_close > panic_close:
+                if current_close > float(recent_close.iloc[i]):
                     return True
-
         return False
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -315,11 +349,10 @@ class ScalpingStrategy:
         Populates the per-candle cache so the subsequent get_signal() call
         reuses it without rebuilding the DataFrame a second time.
         """
-        min_bars = self._swing_bars + self.atr_period + 5
+        min_bars = self._break_bars + self._swing_bars + self.atr_period + 5
         if state.candle_count() < min_bars:
             return {}
 
-        # _refresh_cache is also called by get_signal — whichever runs first wins.
         self._refresh_cache(state)
 
         df  = self._cache_df
@@ -327,8 +360,8 @@ class ScalpingStrategy:
         vol = df["volume"]
         avg_vol = float(vol.iloc[-20:].mean()) if len(vol) >= 20 else float(vol.mean())
 
-        swing_low  = _swing_low(df["low"], self._swing_bars)
-        swing_high = _swing_high(df["high"], self._swing_bars)
+        broken_res = _find_broken_resistance(df, self._swing_bars, self._break_bars)
+        broken_sup = _find_broken_support(df, self._swing_bars, self._break_bars)
         latest_oi  = state.oi_history[-1] if state.oi_history else 0.0
         oi_mean    = (
             sum(list(state.oi_history)[-self._oi_mean_bars:]) / self._oi_mean_bars
@@ -336,15 +369,16 @@ class ScalpingStrategy:
         )
 
         return {
-            "mark_price":  state.mark_price,
-            "atr":         round(atr, 5),
-            "swing_low":   round(swing_low, 4),
-            "swing_high":  round(swing_high, 4),
-            "touch_dist":  round(atr * self._touch_mult, 5),
-            "oi_latest":   round(latest_oi, 2),
-            "oi_mean":     round(oi_mean, 2),
-            "oi_rising":   self._oi_is_rising(state),
-            "vol_ratio":   round(float(vol.iloc[-1]) / avg_vol, 2) if avg_vol else 0,
-            "candles":     state.candle_count(),
-            "oi_readings": len(state.oi_history),
+            "mark_price":       state.mark_price,
+            "atr":              round(atr, 5),
+            "broken_resistance": round(broken_res, 4) if broken_res else None,
+            "broken_support":    round(broken_sup, 4) if broken_sup else None,
+            "touch_dist":       round(atr * self._touch_mult, 5),
+            "oi_latest":        round(latest_oi, 2),
+            "oi_mean":          round(oi_mean, 2),
+            "oi_rising":        self._oi_is_rising(state),
+            "oi_falling":       self._oi_is_falling(state),
+            "vol_ratio":        round(float(vol.iloc[-1]) / avg_vol, 2) if avg_vol else 0,
+            "candles":          state.candle_count(),
+            "oi_readings":      len(state.oi_history),
         }

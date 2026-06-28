@@ -1,7 +1,7 @@
 .PHONY: help up down stop restart logs status ps rebuild shell tail
 
 COMPOSE  = docker compose
-SERVICE  = binance-bot-v2
+SERVICE  = binance-bot-v1
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -33,7 +33,7 @@ rebuild: ## Force full image rebuild (use after requirements.txt changes)
 	$(COMPOSE) up -d
 
 shell: ## Open a bash shell inside the running container
-	docker exec -it binance_python_bot_v2 bash
+	docker exec -it binance_python_bot_v1 bash
 
 tail: ## Tail trades.log on the host (no container needed)
 	tail -f trades.log
