@@ -1,0 +1,21 @@
+name: __PROJECT__
+
+services:
+  __SERVICE__:
+    build:
+      context: .
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    container_name: __CONTAINER__
+    restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"
+    env_file:
+      - __ENV_FILE__
+    volumes:
+      - .:/usr/src/app
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"

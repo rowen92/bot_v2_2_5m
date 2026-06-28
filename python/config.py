@@ -67,8 +67,8 @@ class Config:
 
     # ── Fees ───────────────────────────────────────────────────────────────────
     # Only taker fee is used — all entries and exits are MARKET orders.
-    # For regular USDT pairs set TAKER_FEE_PCT=0.05
-    TAKER_FEE_PCT: float = _float("TAKER_FEE_PCT", 0.04)   # % per side
+    # WLDUSDT (USDT pair): 0.05% taker  |  WLDUSDC (USDC pair): 0.04% taker
+    TAKER_FEE_PCT: float = _float("TAKER_FEE_PCT", 0.05)   # % per side
 
     # ── Trailing Take-Profit ───────────────────────────────────────────────────
     # TRAIL_ACTIVATE_PCT: how far price must move from entry to arm the trail
@@ -98,17 +98,6 @@ class Config:
     QTY_STEP: float    = _float("QTY_STEP", 0.1)
     QTY_MIN: float     = _float("QTY_MIN", 0.1)    # minimum order size
     PRICE_PRECISION: int = _int("PRICE_PRECISION", 4)  # decimal places for prices
-
-    # ── WebSocket multiplex stream names ───────────────────────────────────────
-    @classmethod
-    def ws_streams(cls) -> list[str]:
-        sym = cls.SYMBOL.lower()
-        interval = cls.KLINE_INTERVAL
-        return [
-            f"{sym}@kline_{interval}",
-            f"{sym}@depth20@100ms",
-            f"{sym}@markPrice@1s",   # @1s cadence carries the OI field "o"
-        ]
 
     # ── Paths ──────────────────────────────────────────────────────────────────
     LOG_FILE: str = os.path.join(os.path.dirname(__file__), "..", "trades.log")

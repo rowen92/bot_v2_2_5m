@@ -1,39 +1,51 @@
-.PHONY: help up down stop restart logs status ps rebuild shell tail
+.PHONY: help _generate up down stop restart logs status ps rebuild shell tail
 
+ENV_FILE = .env
+-include $(ENV_FILE)
 COMPOSE  = docker compose
-SERVICE  = binance-bot-v1
+
+_generate: ## Render docker-compose.yml from template for BOT
+	@sed \
+		-e "s|__PROJECT__|$(COMPOSE_PROJECT_NAME)|g" \
+		-e "s|__SERVICE__|$(SERVICE)|g" \
+		-e "s|__CONTAINER__|$(CONTAINER)|g" \
+		-e "s|__ENV_FILE__|$(ENV_FILE)|g" \
+		docker-compose.template.yml > docker-compose.yml
+	@echo "→ docker-compose.yml  PROJECT=$(COMPOSE_PROJECT_NAME)  SERVICE=$(SERVICE)  CONTAINER=$(CONTAINER)  ENV=$(ENV_FILE)"
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
-up: ## Build image (if needed) and start the bot in background
+up: _generate ## Build and start
 	$(COMPOSE) up -d --build
 
-down: ## Stop and remove containers
+down: _generate ## Stop and remove containers
 	$(COMPOSE) down
 
-stop: ## Stop containers without removing them
+stop: _generate ## Stop containers without removing
 	$(COMPOSE) stop
 
-restart: down up ## Stop → rebuild → start
+restart: _generate ## Stop → rebuild → start
+	$(COMPOSE) down
+	$(COMPOSE) up -d --build
 
-logs: ## Follow live container stdout (Ctrl+C to exit)
-	$(COMPOSE) logs -f --tail=100 $(SERVICE)
+logs: _generate ## Follow live logs
+	$(COMPOSE) logs -f --tail=100
 
-status: ## Show container status
-	$(COMPOSE) ps $(SERVICE)
-
-ps: ## List all containers for this project
+status: _generate ## Show container status
 	$(COMPOSE) ps
 
-rebuild: ## Force full image rebuild (use after requirements.txt changes)
+ps: _generate ## List all containers for this project
+	$(COMPOSE) ps
+
+rebuild: _generate ## Force full image rebuild
 	$(COMPOSE) down
 	$(COMPOSE) build --no-cache
 	$(COMPOSE) up -d
 
-shell: ## Open a bash shell inside the running container
-	docker exec -it binance_python_bot_v1 bash
+shell: ## Open bash inside container
+	docker exec -it $(CONTAINER) bash
 
-tail: ## Tail trades.log on the host (no container needed)
+tail: ## Tail trades.log on the host
 	tail -f trades.log
