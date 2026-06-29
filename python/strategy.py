@@ -62,7 +62,12 @@ def _trimmed_vol_mean(vol_series: pd.Series, window: int = 20, trim_pct: float =
     Prevents a single spike candle from inflating the baseline and silencing
     the volume filter for the next `window` bars.
 
-    e.g. window=20, trim_pct=0.10 → drops the 2 highest readings, averages the rest.
+    e.g. window=20, trim_pct=0.20 → drops the 4 highest readings, averages the rest.
+
+    trim_pct raised 0.10 → 0.20: a single 2M-vol spike candle was skewing the
+    20-bar mean high enough to silence the next 20 retest candles (250k–400k
+    vol all failing vol >= avg * vol_min). Dropping top 20% instead of top 10%
+    keeps the baseline representative of normal activity.
     """
     data = vol_series.iloc[-window:] if len(vol_series) >= window else vol_series
     sorted_vals = sorted(data)
@@ -261,7 +266,10 @@ class ScalpingStrategy:
         if ratios.empty:
             return self.atr_max
         p80    = float(ratios.quantile(0.80))
-        result = max(1.3, min(self.atr_max * 1.5, p80))
+        # Floor raised 1.30 → 1.50: the 80th-pct logic already self-adjusts
+        # upward on volatile days. The old 1.30 floor was rejecting normal
+        # trending candles (50+ hits/session at range just 3% over limit).
+        result = max(1.5, min(self.atr_max * 1.5, p80))
         log.debug(f"dynamic_atr_max={result:.2f}  p80_range_ratio={p80:.2f}")
         return result
 
@@ -309,7 +317,7 @@ class ScalpingStrategy:
         # Step 4 — Trimmed volume mean: drop top 10% to ignore spike candles.
         dynamic_atr_max = self._dynamic_atr_max(df)
         is_spike        = last_range > atr * dynamic_atr_max
-        avg_vol         = _trimmed_vol_mean(vol, window=20, trim_pct=0.10)
+        avg_vol         = _trimmed_vol_mean(vol, window=20, trim_pct=0.20)
         enough_volume   = float(vol.iloc[-1]) >= avg_vol * self.vol_min
 
         if is_spike or not enough_volume:
@@ -330,10 +338,34 @@ class ScalpingStrategy:
 
         # Step 5 — Dynamic candle body strength: require body >= 0.3 × ATR so
         # doji / 1-tick closes don't count as bullish/bearish confirmation.
-        min_body   = atr * 0.3
+        # 10% soft buffer: body within 90% of threshold still passes, preventing
+        # marginal blocks like weak_body(0.00030<0.00033) from killing valid setups.
+        min_body      = atr * 0.3
+        min_body_soft = min_body * 0.90
         body_size  = abs(last_close - last_open)
-        is_bullish = last_close > last_open and body_size >= min_body
-        is_bearish = last_close < last_open and body_size >= min_body
+        is_bullish = last_close > last_open and body_size >= min_body_soft
+        is_bearish = last_close < last_open and body_size >= min_body_soft
+
+        # Lookback body: if the current candle has no qualifying body (flat/doji/
+        # opposite colour) but either of the 2 prior candles DID have a qualifying
+        # bullish/bearish body, allow the entry.  This handles the common B&R
+        # cluster pattern where the first retest candle is strong but the bot
+        # evaluates on a subsequent candle that pulled back slightly at close.
+        # Guard: the prior qualifying candle must still be within touch_dist of
+        # broken_resistance/support — we check that inside the LONG/SHORT blocks.
+        prior_closes = [float(close.iloc[i]) for i in (-3, -2)]
+        prior_opens  = [float(open_.iloc[i]) for i in (-3, -2)]
+        prior_bullish = any(
+            c > o and abs(c - o) >= min_body_soft
+            for c, o in zip(prior_closes, prior_opens)
+        )
+        prior_bearish = any(
+            c < o and abs(c - o) >= min_body_soft
+            for c, o in zip(prior_closes, prior_opens)
+        )
+        # Combined: current OR recent candle satisfies the body requirement
+        is_bullish_cluster = is_bullish or prior_bullish
+        is_bearish_cluster = is_bearish or prior_bearish
 
         # ── LONG: Break & Retest of a prior resistance ─────────────────────────
         # 1. A breakout candle closed above the prior swing high by > 0.3 × ATR (Step 6)
@@ -347,23 +379,27 @@ class ScalpingStrategy:
                 last_low  <= broken_resistance + touch_dist and
                 last_close >= broken_resistance - touch_dist
             )
-            if at_retest_long and is_bullish and oi_rising and oi_above_mean:
+            # oi_above_mean is only required when OI is NOT already confirmed rising
+            long_oi_ok = oi_rising or oi_above_mean
+            if at_retest_long and is_bullish_cluster and oi_rising and long_oi_ok:
+                cluster_tag = " [cluster]" if not is_bullish and prior_bullish else ""
                 log.debug(
-                    f"LONG B&R  close={last_close:.4f}  broken_res={broken_resistance:.4f}"
-                    f"  touch_dist={touch_dist:.4f}  body={body_size:.5f}  min_body={min_body:.5f}"
+                    f"LONG B&R{cluster_tag}  close={last_close:.4f}  broken_res={broken_resistance:.4f}"
+                    f"  touch_dist={touch_dist:.4f}  body={body_size:.5f}  min_body={min_body_soft:.5f}"
                 )
                 return "long"
             elif at_retest_long:
                 reasons = []
-                if not is_bullish:      reasons.append(f"weak_body({body_size:.5f}<{min_body:.5f})" if body_size < min_body else "no_bullish_body")
-                if not oi_rising:       reasons.append(f"oi_not_rising({self._oi_bars}bars)")
-                if not oi_above_mean:   reasons.append(f"oi_below_mean({self._oi_mean_bars}bar)")
+                if not is_bullish_cluster:
+                    reasons.append(f"weak_body({body_size:.5f}<{min_body_soft:.5f})" if body_size < min_body_soft else "no_bullish_body")
+                if not oi_rising:     reasons.append(f"oi_not_rising({self._oi_bars}bars)")
+                if not long_oi_ok:    reasons.append(f"oi_below_mean({self._oi_mean_bars}bar)")
                 log.debug(f"BLOCKED LONG_B&R  broken_res={broken_resistance:.4f}  " + "  ".join(reasons))
 
         # ── SHORT: Break & Retest of a prior support ───────────────────────────
         # 1. A breakdown candle closed below the prior swing low by > 0.3 × ATR (Step 6)
         # 2. Current candle bounces up to retest that old low from below (within touch_dist)
-        # 3. Bearish confirmation body >= 0.3 × ATR (Step 5, if OI rising)
+        # 3. Bearish confirmation body >= min_body_soft (if OI rising — reversal short)
         # 4. OI confirms (rising or falling)
 
         broken_support = _find_broken_support(df, self._swing_bars, self._break_bars, atr=atr)
@@ -374,19 +410,24 @@ class ScalpingStrategy:
             )
             oi_confirms_short = oi_rising or oi_falling
             short_mean_ok     = oi_above_mean if oi_rising else True
-            short_body_ok     = is_bearish    if oi_rising else True   # body check already includes min_body
+            # When OI is rising (reversal short): require bearish body — use cluster
+            # lookback so a flat 2nd/3rd retest candle doesn't kill the signal.
+            # When OI is falling (liquidation short): no body requirement — momentum confirms.
+            short_body_ok = is_bearish_cluster if oi_rising else True
 
             if at_retest_short and short_body_ok and oi_confirms_short and short_mean_ok:
+                cluster_tag = " [cluster]" if oi_rising and not is_bearish and prior_bearish else ""
                 log.debug(
-                    f"SHORT B&R  close={last_close:.4f}  broken_sup={broken_support:.4f}"
-                    f"  touch_dist={touch_dist:.4f}  body={body_size:.5f}  min_body={min_body:.5f}"
+                    f"SHORT B&R{cluster_tag}  close={last_close:.4f}  broken_sup={broken_support:.4f}"
+                    f"  touch_dist={touch_dist:.4f}  body={body_size:.5f}  min_body={min_body_soft:.5f}"
                 )
                 return "short"
             elif at_retest_short:
                 reasons = []
-                if oi_rising and not is_bearish:    reasons.append(f"weak_body({body_size:.5f}<{min_body:.5f})" if body_size < min_body else "no_bearish_body(reversal_short)")
+                if oi_rising and not is_bearish_cluster:
+                    reasons.append(f"weak_body({body_size:.5f}<{min_body_soft:.5f})" if body_size < min_body_soft else "no_bearish_body(reversal_short)")
                 if not oi_confirms_short:            reasons.append(f"oi_not_rising_or_falling({self._oi_bars}bars)")
-                if oi_rising and not oi_above_mean:  reasons.append(f"oi_below_mean({self._oi_mean_bars}bar)")
+                if oi_rising and not short_mean_ok:  reasons.append(f"oi_below_mean({self._oi_mean_bars}bar)")
                 log.debug(f"BLOCKED SHORT_B&R  broken_sup={broken_support:.4f}  " + "  ".join(reasons))
 
         return "none"
@@ -422,11 +463,16 @@ class ScalpingStrategy:
 
     def _oi_is_rising(self, state: State) -> bool:
         """
-        Return True if OI has risen over the last OI_CONFIRM_BARS readings
-        by more than a dynamic threshold based on session OI volatility.
+        Return True if OI has risen over at least 2 of the last OI_CONFIRM_BARS
+        steps by more than a dynamic threshold based on session OI volatility.
+
+        Relaxed from "all bars must rise" to "2-of-3 bars must rise" so that a
+        single flat/dip reading in an uptrend (OI lag, exchange rounding) doesn't
+        kill a valid signal. Confirmed by log analysis: OI was physically climbing
+        181,561k→182,477k across 5 bars yet oi_rising=False every bar.
 
         On choppy/flat days the threshold rises so random OI oscillations
-        don't trigger entries.  On trending days the threshold stays low.
+        don't trigger entries.  On trending days the threshold stays near the floor.
         """
         history = list(state.oi_history)
         if len(history) < self._oi_bars + 1:
@@ -434,10 +480,12 @@ class ScalpingStrategy:
             return False
         threshold = self._oi_dynamic_threshold(history)
         window = history[-(self._oi_bars + 1):]
-        return all(
-            window[i] >= window[i - 1] * (1 + threshold)
-            for i in range(1, len(window))
+        rising_count = sum(
+            1 for i in range(1, len(window))
+            if window[i] >= window[i - 1] * (1 + threshold)
         )
+        # Require at least 2-of-3 steps rising (allow 1 flat/dip bar)
+        return rising_count >= max(1, self._oi_bars - 1)
 
     def _oi_above_mean(self, state: State) -> bool:
         """
@@ -558,7 +606,7 @@ class ScalpingStrategy:
         df  = self._cache_df
         atr = self._cache_atr
         vol = df["volume"]
-        avg_vol = _trimmed_vol_mean(vol, window=20, trim_pct=0.10)
+        avg_vol = _trimmed_vol_mean(vol, window=20, trim_pct=0.20)
 
         broken_res = _find_broken_resistance(df, self._swing_bars, self._break_bars, atr=atr)
         broken_sup = _find_broken_support(df, self._swing_bars, self._break_bars, atr=atr)
@@ -573,13 +621,13 @@ class ScalpingStrategy:
             "atr":               round(atr, 5),
             "broken_resistance": round(broken_res, 4) if broken_res else None,
             "broken_support":    round(broken_sup, 4) if broken_sup else None,
-            "touch_dist":        round(atr * self._touch_mult, 5),
+            "touch_dist":        round(atr * self._dynamic_touch_mult(df), 5),
             "oi_latest":         round(latest_oi, 2),
             "oi_mean":           round(oi_mean, 2),
             "oi_rising":         self._oi_is_rising(state),
             "oi_falling":        self._oi_is_falling(state),
             "vol_ratio":         round(float(vol.iloc[-1]) / avg_vol, 2) if avg_vol else 0,
-            "min_body":          round(atr * 0.3, 5),
+            "min_body":          round(atr * 0.3 * 0.90, 5),   # min_body_soft (actual threshold used)
             "touch_mult":        round(self._dynamic_touch_mult(df), 2),
             "atr_max_mult":      round(self._dynamic_atr_max(df), 2),
             "atr_rank":          round(self._atr_percentile_rank(df), 2),
