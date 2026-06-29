@@ -23,13 +23,13 @@ import colorlog
 
 from config import cfg
 
-# Root of the project (one level above python/)
-_PROJECT_ROOT    = os.path.dirname(os.path.dirname(os.path.abspath(cfg.LOG_FILE)))
-_LOGS_DIR        = os.path.join(_PROJECT_ROOT, "logs")
-
-# Active log paths (in project root, as before)
-_TRADES_LOG_FILE    = os.path.abspath(cfg.LOG_FILE)
-_POSITIONS_LOG_FILE = os.path.join(os.path.dirname(_TRADES_LOG_FILE), "positions.log")
+# trades.log sits in the project root (v2_wldusdt/trades.log)
+# cfg.LOG_FILE = python/../trades.log — normalize it first
+_TRADES_LOG_FILE    = os.path.normpath(os.path.abspath(cfg.LOG_FILE))
+# Project root = directory that contains trades.log
+_PROJECT_ROOT       = os.path.dirname(_TRADES_LOG_FILE)
+_LOGS_DIR           = os.path.join(_PROJECT_ROOT, "logs")
+_POSITIONS_LOG_FILE = os.path.join(_PROJECT_ROOT, "positions.log")
 
 
 def _archive_logs() -> None:
