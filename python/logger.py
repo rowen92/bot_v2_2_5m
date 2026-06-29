@@ -3,27 +3,57 @@ logger.py – Configures coloured console logging + file logging to trades.log.
 
 Every trade event is written as a structured line to trades.log so it can
 be parsed later for analytics.
+
+On each startup, any existing trades.log / positions.log are archived to:
+    logs/trades.YYYY-MM-DD_HH-MM-SS.log
+    logs/positions.YYYY-MM-DD_HH-MM-SS.log
+so no session data is ever overwritten.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import shutil
 import sys
 import time
+from datetime import datetime
 
 import colorlog
 
 from config import cfg
 
-# Path for the positions-only log (sits next to trades.log)
-_POSITIONS_LOG_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(cfg.LOG_FILE)), "positions.log"
-)
+# Root of the project (one level above python/)
+_PROJECT_ROOT    = os.path.dirname(os.path.dirname(os.path.abspath(cfg.LOG_FILE)))
+_LOGS_DIR        = os.path.join(_PROJECT_ROOT, "logs")
+
+# Active log paths (in project root, as before)
+_TRADES_LOG_FILE    = os.path.abspath(cfg.LOG_FILE)
+_POSITIONS_LOG_FILE = os.path.join(os.path.dirname(_TRADES_LOG_FILE), "positions.log")
+
+
+def _archive_logs() -> None:
+    """
+    If trades.log or positions.log already exist, move them into logs/
+    with a datetime suffix before the new session starts.
+
+    e.g.  trades.log  →  logs/trades.2026-06-29_15-58-32.log
+    """
+    os.makedirs(_LOGS_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    for src, name in (
+        (_TRADES_LOG_FILE,    "trades"),
+        (_POSITIONS_LOG_FILE, "positions"),
+    ):
+        if os.path.exists(src) and os.path.getsize(src) > 0:
+            dst = os.path.join(_LOGS_DIR, f"{name}.{stamp}.log")
+            shutil.move(src, dst)
 
 
 def setup_logging() -> None:
     """Call once at startup to configure the root logger."""
+    _archive_logs()
 
     # ── Console handler (coloured) ─────────────────────────────────────────
     console = colorlog.StreamHandler(sys.stdout)

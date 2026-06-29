@@ -11,9 +11,11 @@ docker-compose.yml
 
 # Runtime state & logs
 trades.log
-trades.*.log
 positions.log
 bot_state.json
+
+# Archived logs (logs/trades.YYYY-MM-DD_HH-MM-SS.log etc.)
+logs/
 
 # IDE
 .idea/
