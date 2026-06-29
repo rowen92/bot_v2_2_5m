@@ -41,6 +41,9 @@ class Position:
     order_id:    Optional[str] = None
     open_fee:    float = 0.0  # taker fee paid at entry (stored for accurate pnl reporting)
 
+    # ATR at entry time — used for dynamic trail distances in update_trail()
+    atr:             Optional[float] = None
+
     # Trailing TP state --------------------------------------------------------
     # best_price: highest mark for long, lowest mark for short since entry
     best_price:      float = 0.0   # set to entry_price after open
@@ -92,6 +95,12 @@ class State:
         # bot restart — a crash-restart won't wipe the wait period.
         # Initialised to 0 so the bot can trade immediately on a fresh start.
         self.last_close_ts: float = 0.0
+
+        # Dynamic cooldown tracking
+        # last_close_reason: 'sl' | 'tp' | 'trail_tp' — set by order_manager on close
+        self.last_close_reason: str = ""
+        # consecutive_sl: how many SL hits in a row without a winning trade between them
+        self.consecutive_sl: int = 0
 
         # Concurrency guard: prevents a second tick from triggering a second
         # close while an async _live_close / _paper_close is still in-flight.
@@ -150,8 +159,14 @@ class State:
         self.total_trades += 1
         if pnl >= 0:
             self.winning_trades += 1
+            self.consecutive_sl = 0   # reset streak on any win
         else:
             self.losing_trades += 1
+            if self.last_close_reason == "sl":
+                self.consecutive_sl += 1
+            else:
+                # TRAIL_TP closed at a loss — not a clean SL, don't stack penalty
+                self.consecutive_sl = 0
 
     def daily_loss_pct(self) -> float:
         self._reset_daily_if_needed()

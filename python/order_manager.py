@@ -25,8 +25,14 @@ class OrderManager:
         signal: str,
         state: State,
         client: Optional[AsyncClient] = None,
+        atr: float | None = None,
     ) -> Optional[Position]:
-        """Open a long or short futures position."""
+        """Open a long or short futures position.
+
+        `atr` — current ATR value from the strategy.  When supplied, SL/TP
+        distances and position size are all ATR-based (dynamic).  Falls back
+        to fixed-% config values when None.
+        """
         entry = state.mark_price
         if entry <= 0:
             log.warning("open skipped: mark_price not ready")
@@ -39,12 +45,12 @@ class OrderManager:
             # Keep snapshot current so daily_loss_pct() always has a fresh base.
             if balance > 0:
                 state.live_balance_snapshot = balance
-        qty = rm.position_size(entry, balance)
+        qty = rm.position_size(entry, balance, state=state, atr=atr)
         if qty <= 0:
             log.warning(f"open skipped: position_size=0  balance={balance:.2f}  entry={entry:.4f}")
             return None
-        tp  = rm.tp_price(entry, signal)
-        sl  = rm.sl_price(entry, signal)
+        tp  = rm.tp_price(entry, signal, atr=atr)
+        sl  = rm.sl_price(entry, signal, atr=atr)
 
         if cfg.is_paper():
             pos = self._paper_open(signal, entry, qty, tp, sl, state)
@@ -53,6 +59,7 @@ class OrderManager:
 
         if pos:
             pos.best_price = entry  # initialise trailing high-water-mark
+            pos.atr        = atr    # stored so update_trail() can use ATR-based distances
             state.position = pos
             tlog.log_open(signal, entry, qty, tp, sl, cfg.TRADING_MODE)
 
@@ -102,6 +109,7 @@ class OrderManager:
             display_balance,
             pos.open_time,
         )
+        state.last_close_reason = reason   # used by dynamic cooldown in risk_manager
         state.record_pnl(pnl)
         state.last_close_ts = time.time()   # start cooldown (wall-clock, survives restarts)
         state.position = None

@@ -45,7 +45,8 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
         if not cfg.is_paper():
             live_bal = await orders._live_balance(client)
         if risk.can_trade(state, live_balance=live_bal):
-            await orders.open_position(signal, state, client)
+            atr = indicators.get("atr")   # float from strategy snapshot, or None
+            await orders.open_position(signal, state, client, atr=atr)
         else:
             log.debug(f"SIGNAL={signal.upper()} blocked by can_trade — see risk log above")
 

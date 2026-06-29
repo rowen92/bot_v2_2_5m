@@ -60,10 +60,24 @@ class Config:
 
     # ── Risk ───────────────────────────────────────────────────────────────────
     RISK_PER_TRADE_PCT: float  = _float("RISK_PER_TRADE_PCT", 1.0)
+    # MAX_DAILY_LOSS_PCT: hard stop for the day — no new trades once daily PnL
+    # drops below this % of starting balance. Raised to 5% (from 3%) so that
+    # a choppy morning doesn't block the afternoon trend (see Step 10 analysis).
+    # Steps 2+3 already handle bad streaks via size reduction + cooldown.
+    MAX_DAILY_LOSS_PCT: float  = _float("MAX_DAILY_LOSS_PCT", 5.0)
+    PAPER_INITIAL_BALANCE: float = _float("PAPER_INITIAL_BALANCE", 1000.0)
+
+    # ── ATR-based SL / TP (dynamic — preferred over fixed %) ──────────────────
+    # SL is placed SL_ATR_MULT × ATR away from entry.
+    # TP is placed TP_ATR_MULT × ATR away from entry.
+    # This keeps risk proportional to the current volatility regime.
+    # e.g. ATR=0.0010, SL_ATR_MULT=1.5 → SL distance = 0.0015
+    SL_ATR_MULT: float         = _float("SL_ATR_MULT", 1.5)
+    TP_ATR_MULT: float         = _float("TP_ATR_MULT", 3.0)   # TP:SL ratio = 2:1
+
+    # ── Fixed-% fallback (used only when ATR is unavailable) ──────────────────
     TAKE_PROFIT_PCT: float     = _float("TAKE_PROFIT_PCT", 0.40)
     STOP_LOSS_PCT: float       = _float("STOP_LOSS_PCT", 0.20)
-    MAX_DAILY_LOSS_PCT: float  = _float("MAX_DAILY_LOSS_PCT", 3.0)
-    PAPER_INITIAL_BALANCE: float = _float("PAPER_INITIAL_BALANCE", 1000.0)
 
     # ── Fees ───────────────────────────────────────────────────────────────────
     # Only taker fee is used — all entries and exits are MARKET orders.
@@ -76,9 +90,23 @@ class Config:
     TRAIL_ACTIVATE_PCT: float  = _float("TRAIL_ACTIVATE_PCT", 0.20)
     TRAIL_CALLBACK_PCT: float  = _float("TRAIL_CALLBACK_PCT", 0.10)
 
+    # ATR-based trail activation (used when ATR is available, preferred over fixed %).
+    # Price must move TRAIL_ACTIVATE_ATR_MULT × ATR in your favour before the
+    # trail arms. Kept higher than SL_ATR_MULT so a brief retest near entry
+    # doesn't arm the trail prematurely and close before the real move develops.
+    # e.g. ATR=0.00091, mult=2.0 → trail arms only after 0.00182 move (~2× SL dist)
+    TRAIL_ACTIVATE_ATR_MULT: float = _float("TRAIL_ACTIVATE_ATR_MULT", 2.0)
+
     # ── Signal cooldown ────────────────────────────────────────────────────────
     # Minimum closed candles to wait after any trade close before re-entering
     COOLDOWN_CANDLES: int   = _int("COOLDOWN_CANDLES", 3)
+
+    # ── Daily trade cap — REMOVED (Step 10 replaced by MAX_DAILY_LOSS_PCT) ────
+    # WR-based cap was killing afternoon trend trades after a choppy morning.
+    # The hard safety net is now the daily loss % circuit breaker above.
+    # MAX_DAILY_TRADES kept as a disabled fallback (0 = off) in case we want
+    # to re-enable a hard count ceiling via .env without a code change.
+    MAX_DAILY_TRADES: int   = _int("MAX_DAILY_TRADES", 0)
 
     # ── Candle quality filters ─────────────────────────────────────────────────
     ATR_PERIOD: int         = _int("ATR_PERIOD", 14)
