@@ -31,8 +31,8 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
 
     indicators = strategy.indicator_snapshot(state)
     if not indicators:
-        min_bars = cfg.BREAK_LOOKBACK + cfg.SWING_LOOKBACK + cfg.ATR_PERIOD + 5
-        log.info(f"warming up: {state.candle_count()}/{min_bars} candles")
+        from strategy import _MIN_BARS
+        log.info(f"warming up: {state.candle_count()}/{_MIN_BARS} candles")
         return
 
     # get_signal reuses the cached dataframe — no double computation

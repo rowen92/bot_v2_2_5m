@@ -40,11 +40,15 @@ class RiskManager:
         streak = getattr(state, "consecutive_sl", 0)
 
         if streak >= 2:
-            cooldown = base * 4
+            cooldown = base * 2   # was 4× — too aggressive, was blocking valid signals
         elif reason == "sl":
             cooldown = base * 2
         else:
             cooldown = base
+
+        # Hard cap: never wait more than 120s regardless of streak.
+        # On fast-moving 1m markets a 240s block misses entire trend legs.
+        cooldown = min(cooldown, 120)
 
         if cooldown != base:
             log.debug(
@@ -236,8 +240,8 @@ class RiskManager:
         """
         atr = getattr(pos, "atr", None)
         if atr and atr > 0:
-            activate_dist = atr * cfg.TRAIL_ACTIVATE_ATR_MULT  # arm after 2× ATR in profit (decoupled from SL dist)
-            callback_dist = atr * cfg.SL_ATR_MULT * 0.5        # trail gives back 50% of SL distance
+            activate_dist = atr * cfg.TRAIL_ACTIVATE_ATR_MULT  # arm after N× ATR in profit (decoupled from SL dist)
+            callback_dist = atr * cfg.SL_ATR_MULT * 0.5         # trail gives back 50% of SL distance — balanced between noise tolerance and profit capture
         else:
             activate_dist = pos.entry_price * (cfg.TRAIL_ACTIVATE_PCT / 100)
             callback_dist = pos.entry_price * (cfg.TRAIL_CALLBACK_PCT / 100)

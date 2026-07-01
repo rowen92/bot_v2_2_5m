@@ -55,8 +55,11 @@ class Position:
 
 class State:
     def __init__(self):
-        # Rolling candle buffer (max 200 candles kept in memory)
-        self._candles: deque[Candle] = deque(maxlen=200)
+        # Rolling candle buffer — ~16 hours of 1m candles.
+        # Memory cost is negligible (~56 bytes/candle → ~56 KB total).
+        # The cache-key fix (len, last_open_time) handles indicator freshness;
+        # this larger window gives vol_avg and EMA a stable long-term baseline.
+        self._candles: deque[Candle] = deque(maxlen=1000)
 
         # Latest (possibly open) candle being built from the stream
         self.live_candle: Optional[Candle] = None
@@ -71,7 +74,7 @@ class State:
         # ── Open Interest history ──────────────────────────────────────────────
         # Populated by ws_client every time an openInterest or markPrice+OI
         # message arrives. maxlen keeps memory bounded.
-        self.oi_history: deque[float] = deque(maxlen=200)
+        self.oi_history: deque[float] = deque(maxlen=1000)
 
         # Current open position (None = flat)
         self.position: Optional[Position] = None

@@ -46,17 +46,7 @@ class Config:
     LEVERAGE: int        = _int("LEVERAGE", 10)
     MARGIN_TYPE: str     = os.getenv("MARGIN_TYPE", "ISOLATED").upper()
 
-    # ── Strategy: Break & Retest + Open Interest ──────────────────────────────
-    # How many recent bars to scan for the breakout candle
-    SWING_LOOKBACK: int          = _int("SWING_LOOKBACK", 10)
-    # How many bars before the breakout to measure the prior swing level
-    BREAK_LOOKBACK: int          = _int("BREAK_LOOKBACK", 20)
-    # Max distance from the broken level (in ATR units) that counts as a retest touch
-    STRUCTURE_TOUCH_ATR: float   = _float("STRUCTURE_TOUCH_ATR", 0.5)
-    # How many consecutive OI readings must be rising to confirm entry
-    OI_CONFIRM_BARS: int         = _int("OI_CONFIRM_BARS", 3)
-    # Rolling window for OI mean filter (OI must be above this average)
-    OI_MEAN_BARS: int            = _int("OI_MEAN_BARS", 20)
+    # (old break-retest / OI params removed — strategy is now trend-following)
 
     # ── Risk ───────────────────────────────────────────────────────────────────
     RISK_PER_TRADE_PCT: float  = _float("RISK_PER_TRADE_PCT", 1.0)
@@ -65,15 +55,19 @@ class Config:
     # a choppy morning doesn't block the afternoon trend (see Step 10 analysis).
     # Steps 2+3 already handle bad streaks via size reduction + cooldown.
     MAX_DAILY_LOSS_PCT: float  = _float("MAX_DAILY_LOSS_PCT", 5.0)
-    PAPER_INITIAL_BALANCE: float = _float("PAPER_INITIAL_BALANCE", 1000.0)
+    PAPER_INITIAL_BALANCE: float = _float("PAPER_INITIAL_BALANCE", 150.0)
 
     # ── ATR-based SL / TP (dynamic — preferred over fixed %) ──────────────────
     # SL is placed SL_ATR_MULT × ATR away from entry.
     # TP is placed TP_ATR_MULT × ATR away from entry.
     # This keeps risk proportional to the current volatility regime.
     # e.g. ATR=0.0010, SL_ATR_MULT=1.5 → SL distance = 0.0015
-    SL_ATR_MULT: float         = _float("SL_ATR_MULT", 1.5)
-    TP_ATR_MULT: float         = _float("TP_ATR_MULT", 3.0)   # TP:SL ratio = 2:1
+    # On 1m candles, 1.5× ATR SL is too tight — normal wicks tag it before the
+    # trade develops. 2.0× ATR gives enough breathing room while keeping the
+    # same dollar risk (position size shrinks proportionally via position_size()).
+    # TP scaled to 4.0× ATR to maintain the 2:1 TP:SL ratio.
+    SL_ATR_MULT: float         = _float("SL_ATR_MULT", 2.0)
+    TP_ATR_MULT: float         = _float("TP_ATR_MULT", 4.0)   # TP:SL ratio = 2:1
 
     # ── Fixed-% fallback (used only when ATR is unavailable) ──────────────────
     TAKE_PROFIT_PCT: float     = _float("TAKE_PROFIT_PCT", 0.40)
@@ -95,11 +89,17 @@ class Config:
     # trail arms. Kept higher than SL_ATR_MULT so a brief retest near entry
     # doesn't arm the trail prematurely and close before the real move develops.
     # e.g. ATR=0.00091, mult=2.0 → trail arms only after 0.00182 move (~2× SL dist)
-    TRAIL_ACTIVATE_ATR_MULT: float = _float("TRAIL_ACTIVATE_ATR_MULT", 2.0)
+    # Raised from 2.0 → 3.0: trail only arms after a real move (3× ATR).
+    # At 2.0 the trail was activating too close to entry, then giving back
+    # almost all the profit via callback — resulting in R:R < 0.5:1.
+    # With 3.0 activation and tighter callback (0.4 in risk_manager),
+    # minimum guaranteed profit = 3×ATR - 0.8×ATR = 2.2×ATR → R:R ≈ 1.1:1
+    TRAIL_ACTIVATE_ATR_MULT: float = _float("TRAIL_ACTIVATE_ATR_MULT", 3.0)
 
     # ── Signal cooldown ────────────────────────────────────────────────────────
     # Minimum closed candles to wait after any trade close before re-entering
-    COOLDOWN_CANDLES: int   = _int("COOLDOWN_CANDLES", 3)
+    # 1 candle cooldown on 1m — allows catching the next trend leg quickly
+    COOLDOWN_CANDLES: int   = _int("COOLDOWN_CANDLES", 1)
 
     # ── Daily trade cap — REMOVED (Step 10 replaced by MAX_DAILY_LOSS_PCT) ────
     # WR-based cap was killing afternoon trend trades after a choppy morning.
@@ -110,15 +110,6 @@ class Config:
 
     # ── Candle quality filters ─────────────────────────────────────────────────
     ATR_PERIOD: int         = _int("ATR_PERIOD", 14)
-    ATR_MAX_MULT: float     = _float("ATR_MAX_MULT", 1.8)      # reject spike candles
-    VOLUME_MIN_MULT: float  = _float("VOLUME_MIN_MULT", 0.6)   # dead-market filter
-
-    # ── Post-panic recovery filter ─────────────────────────────────────────────
-    # Suppresses OI-falling SHORT signals during short-covering rallies after a flush.
-    # PANIC_VOL_MULT: candle volume must be this many × avg to count as a panic flush
-    # POST_PANIC_BARS: how many bars after the panic to remain in suppression mode
-    PANIC_VOL_MULT: float   = _float("PANIC_VOL_MULT", 4.0)
-    POST_PANIC_BARS: int    = _int("POST_PANIC_BARS", 20)
 
     # ── Symbol precision ───────────────────────────────────────────────────────
     # Qty step size for the traded symbol (Binance lot size filter)
