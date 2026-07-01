@@ -6,11 +6,16 @@ Entry logic:
   - ADX > threshold to confirm real momentum (filters out choppy sideways markets)
   - Volume above rolling average to confirm participation
   - ATR computed for SL/TP sizing in risk_manager / order_manager
+  - EMA 100 as long-term bias filter — only long above it, only short below it
+  - Trend continuation re-entry — re-enter in trend direction after SL/cooldown
+    when EMA alignment + ADX still strong, no fresh cross required
 
 Signal:
-  - 'long'  when fast EMA crosses above slow EMA + ADX confirms
-  - 'short' when fast EMA crosses below slow EMA + ADX confirms
-  - 'none'  otherwise (choppy / no crossover)
+  - 'long'  — cross=bull + ADX>30 + vol + no spike + EMA8>EMA21 + close>EMA100
+           OR — continuation: EMA8>EMA21 + ADX>45 + vol + no spike + close>EMA100
+  - 'short' — cross=bear + ADX>30 + vol + no spike + EMA8<EMA21 + close<EMA100
+           OR — continuation: EMA8<EMA21 + ADX>45 + vol + no spike + close<EMA100
+  - 'none'  otherwise
 
 The trailing stop in order_manager rides the position as far as the trend goes.
 """
@@ -27,20 +32,22 @@ from state import State
 log = logging.getLogger("strategy")
 
 # ── Tuneable parameters ───────────────────────────────────────────────────────
-EMA_FAST   = 8     # wider fast EMA — requires ~8 bars of momentum, avoids single-candle flips
-EMA_SLOW   = 21    # wider slow EMA — genuine medium-term trend reference (Fib 21)
-ADX_PERIOD = 10    # shorter ADX window — reacts faster on 1m
-ADX_MIN    = 30.0  # minimum trend strength — blocks choppy low-momentum entries
-VOL_MA        = 10    # faster volume average for 1m context
-VOL_MULT      = 0.6   # more permissive — low-vol 1m bars are normal
-SPIKE_ATR_MULT = 1.5  # skip signal if candle range > 1.5× ATR (exhaustion spike)
+EMA_FAST      = 8      # fast EMA — momentum detection
+EMA_SLOW      = 21     # slow EMA — medium-term trend reference (Fib 21)
+EMA_TREND     = 100    # long-term bias — only long above, only short below
+ADX_PERIOD    = 10     # shorter ADX window — reacts faster on 1m
+ADX_MIN       = 30.0   # minimum ADX for crossover entries
+ADX_TREND_MIN = 45.0   # higher ADX required for trend-continuation entries
+VOL_MA        = 10     # volume average window
+VOL_MULT      = 0.6    # volume must be at least 60% of average
+SPIKE_ATR_MULT = 1.5   # skip signal if candle range > 1.5× ATR (exhaustion spike)
 
 # Warm-up: need at least this many closed candles before any signal
 _MIN_BARS = max(EMA_SLOW, ADX_PERIOD, VOL_MA) + 5
 
 
 class ScalpingStrategy:
-    """Trend-following strategy using EMA crossover + ADX + volume filter."""
+    """Trend-following strategy using EMA crossover + ADX + volume + EMA100 bias."""
 
     _last_df_hash: Optional[int] = None
     _cached_df: Optional[pd.DataFrame] = None
@@ -59,14 +66,15 @@ class ScalpingStrategy:
 
         row = df.iloc[-1]
         return {
-            "ema_fast": round(row["ema_fast"], cfg.PRICE_PRECISION),
-            "ema_slow": round(row["ema_slow"], cfg.PRICE_PRECISION),
-            "adx":      round(row["adx"],      2),
-            "atr":      round(row["atr"],      cfg.PRICE_PRECISION + 1),
-            "volume":   round(row["volume"],   2),
-            "vol_avg":  round(row["vol_avg"],  2),
-            "cross":    row["cross"],   # 'bull' | 'bear' | 'none'
-            "close":    round(row["close"], cfg.PRICE_PRECISION),
+            "ema_fast":  round(row["ema_fast"],  cfg.PRICE_PRECISION),
+            "ema_slow":  round(row["ema_slow"],  cfg.PRICE_PRECISION),
+            "ema_trend": round(row["ema_trend"], cfg.PRICE_PRECISION),
+            "adx":       round(row["adx"],       2),
+            "atr":       round(row["atr"],       cfg.PRICE_PRECISION + 1),
+            "volume":    round(row["volume"],    2),
+            "vol_avg":   round(row["vol_avg"],   2),
+            "cross":     row["cross"],   # 'bull' | 'bear' | 'none'
+            "close":     round(row["close"], cfg.PRICE_PRECISION),
         }
 
     def get_signal(self, state: State) -> str:
@@ -77,27 +85,24 @@ class ScalpingStrategy:
 
         row = df.iloc[-1]
 
-        adx_ok   = row["adx"]          >= ADX_MIN
-        vol_ok   = row["volume"]       >= row["vol_avg"] * VOL_MULT
-        spike_ok = row["candle_range"] <= row["atr"] * SPIKE_ATR_MULT
-        cross    = row["cross"]
+        adx_ok       = row["adx"]          >= ADX_MIN
+        adx_trend_ok = row["adx"]          >= ADX_TREND_MIN
+        vol_ok       = row["volume"]       >= row["vol_avg"] * VOL_MULT
+        spike_ok     = row["candle_range"] <= row["atr"] * SPIKE_ATR_MULT
+        cross        = row["cross"]
 
-        ema_fast = row["ema_fast"]
-        ema_slow = row["ema_slow"]
+        ema_fast  = row["ema_fast"]
+        ema_slow  = row["ema_slow"]
+        ema_trend = row["ema_trend"]
+        close     = row["close"]
 
-        # Trend filter: only trade with the prevailing EMA trend.
-        # LONG only when fast EMA is above slow EMA (uptrend).
-        # SHORT only when fast EMA is below slow EMA (downtrend).
-        # This blocks counter-trend trades that were causing repeated SL hits.
         in_uptrend   = ema_fast > ema_slow
         in_downtrend = ema_fast < ema_slow
 
-        if cross == "bull" and adx_ok and vol_ok and spike_ok and in_uptrend:
-            log.info(
-                f"SIGNAL long  |  cross=bull  adx={row['adx']:.1f}  "
-                f"vol={row['volume']:.0f}  vol_avg={row['vol_avg']:.0f}"
-            )
-            return "long"
+        # EMA100 bias: only long above, only short below
+        # Conflict zone (e.g. price > EMA100 but EMA8 < EMA21) → no trade
+        bias_long  = close > ema_trend
+        bias_short = close < ema_trend
 
         if not spike_ok:
             log.debug(
@@ -105,10 +110,36 @@ class ScalpingStrategy:
                 f"  atr_limit={row['atr'] * SPIKE_ATR_MULT:.5f}"
             )
 
-        if cross == "bear" and adx_ok and vol_ok and spike_ok and in_downtrend:
+        # ── 1. Crossover entries (fresh cross signal) ─────────────────────────
+        if cross == "bull" and adx_ok and vol_ok and spike_ok and in_uptrend and bias_long:
+            log.info(
+                f"SIGNAL long  |  cross=bull  adx={row['adx']:.1f}  "
+                f"vol={row['volume']:.0f}  ema100={ema_trend:.4f}  close={close:.4f}"
+            )
+            return "long"
+
+        if cross == "bear" and adx_ok and vol_ok and spike_ok and in_downtrend and bias_short:
             log.info(
                 f"SIGNAL short |  cross=bear  adx={row['adx']:.1f}  "
-                f"vol={row['volume']:.0f}  vol_avg={row['vol_avg']:.0f}"
+                f"vol={row['volume']:.0f}  ema100={ema_trend:.4f}  close={close:.4f}"
+            )
+            return "short"
+
+        # ── 2. Trend continuation entries (no fresh cross needed) ─────────────
+        # Re-enters after SL+cooldown when trend is still strongly intact.
+        # Requires ADX >= 45 (vs 30 for crossover) to avoid choppy re-entries.
+        # EMA100 bias still enforced — never trade against long-term trend.
+        if in_uptrend and adx_trend_ok and vol_ok and spike_ok and bias_long:
+            log.info(
+                f"SIGNAL long  |  continuation  adx={row['adx']:.1f}  "
+                f"vol={row['volume']:.0f}  ema100={ema_trend:.4f}  close={close:.4f}"
+            )
+            return "long"
+
+        if in_downtrend and adx_trend_ok and vol_ok and spike_ok and bias_short:
+            log.info(
+                f"SIGNAL short |  continuation  adx={row['adx']:.1f}  "
+                f"vol={row['volume']:.0f}  ema100={ema_trend:.4f}  close={close:.4f}"
             )
             return "short"
 
@@ -181,6 +212,7 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df["ema_fast"]     = _ema(df["close"], EMA_FAST)
     df["ema_slow"]     = _ema(df["close"], EMA_SLOW)
+    df["ema_trend"]    = _ema(df["close"], EMA_TREND)
     df["atr"]          = _atr(df, cfg.ATR_PERIOD)
     df["adx"]          = _adx(df, ADX_PERIOD)
     df["vol_avg"]      = df["volume"].rolling(VOL_MA, min_periods=1).mean()
