@@ -83,8 +83,15 @@ async def _run_stream(
     stream_name: str,
     handler: Callable[[dict], Awaitable[None]],
 ) -> None:
-    """Connect to a single Binance stream with automatic reconnection."""
+    """Connect to a single Binance stream with automatic reconnection.
+
+    Handler exceptions are caught and logged but do NOT kill the stream —
+    the connection stays open and the next message is processed normally.
+    Reconnect delay uses exponential backoff (5s → 10s → 20s → 40s → 60s cap)
+    so a flapping stream never spams Binance with rapid reconnects.
+    """
     url = base_url + stream_name
+    delay = _RECONNECT_DELAY  # reset to base on a clean connection
     while True:
         try:
             async with websockets.connect(
@@ -94,6 +101,7 @@ async def _run_stream(
                 open_timeout=15,
             ) as ws:
                 log.info(f"Connected: {stream_name}")
+                delay = _RECONNECT_DELAY  # successful connection — reset backoff
                 while True:
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=30)
@@ -103,11 +111,19 @@ async def _run_stream(
                     except websockets.ConnectionClosed as exc:
                         log.warning(f"connection closed ({stream_name}): {exc} — reconnecting …")
                         break
-                    await handler(json.loads(raw))
+                    # ── Handler crash isolation ───────────────────────────────
+                    # A bug in the handler (NameError, TypeError, etc.) is caught
+                    # here so it NEVER propagates up and kills the WS connection.
+                    # The stream stays alive; only that one message is skipped.
+                    try:
+                        await handler(json.loads(raw))
+                    except Exception as exc:
+                        log.error(f"handler error ({stream_name}): {exc}", exc_info=True)
         except Exception as exc:
             log.error(f"ws error ({stream_name}): {exc}")
-        log.warning(f"Disconnected ({stream_name}) — reconnecting in {_RECONNECT_DELAY}s …")
-        await asyncio.sleep(_RECONNECT_DELAY)
+        log.warning(f"Disconnected ({stream_name}) — reconnecting in {delay}s …")
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 60)  # exponential backoff, cap at 60s
 
 
 async def run_streams(
