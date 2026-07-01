@@ -35,6 +35,7 @@ def _parse_kline(data: dict, state: State) -> None:
     state.live_candle = candle
     if candle.is_closed:
         state.add_closed_candle(candle)
+        state.last_candle_close = candle.close  # used for breakeven SL confirmation
         log.debug(
             f"candle closed  close={candle.close}  vol={candle.volume:.1f}"
             f"  total={state.candle_count()}"

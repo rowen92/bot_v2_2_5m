@@ -109,6 +109,17 @@ class State:
         # close while an async _live_close / _paper_close is still in-flight.
         self.is_closing: bool = False
 
+        # Live ATR — updated every closed candle from strategy indicators.
+        # Used by update_trail() so callback_dist adapts to current volatility
+        # instead of being frozen at the ATR value from entry time.
+        self.live_atr: Optional[float] = None
+
+        # Close price of the most recently closed candle.
+        # Used by order_manager to confirm breakeven SL on candle close
+        # rather than on a wick tick — prevents spike candles from
+        # shaking out a position that closed above the SL level.
+        self.last_candle_close: float = 0.0
+
         # Guard to emit the "balance snapshot missing" critical log only once,
         # not on every tick.
         self._balance_missing_logged: bool = False

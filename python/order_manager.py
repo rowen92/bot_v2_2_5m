@@ -142,7 +142,7 @@ class OrderManager:
         hit = None
 
         # ── Trailing TP (takes priority over fixed TP once active) ────────────
-        if rm.update_trail(pos, price):
+        if rm.update_trail(pos, price, live_atr=state.live_atr):
             hit = "trail_tp"
 
         # ── Fixed TP / SL (still used before trail activates) ─────────────────
@@ -151,12 +151,23 @@ class OrderManager:
                 if not pos.trail_active and price >= pos.tp_price:
                     hit = "tp"
                 elif price <= pos.sl_price:
-                    hit = "sl"
+                    # Breakeven SL: only exit on candle close, not on a wick tick.
+                    # Original hard SL fires immediately (real loss protection).
+                    if pos.sl_price >= pos.entry_price:
+                        if state.last_candle_close and state.last_candle_close <= pos.sl_price:
+                            hit = "sl"
+                    else:
+                        hit = "sl"
             else:  # short
                 if not pos.trail_active and price <= pos.tp_price:
                     hit = "tp"
                 elif price >= pos.sl_price:
-                    hit = "sl"
+                    # Breakeven SL: only exit on candle close, not on a wick tick.
+                    if pos.sl_price <= pos.entry_price:
+                        if state.last_candle_close and state.last_candle_close >= pos.sl_price:
+                            hit = "sl"
+                    else:
+                        hit = "sl"
 
         if hit:
             state.is_closing = True

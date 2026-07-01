@@ -27,12 +27,13 @@ from state import State
 log = logging.getLogger("strategy")
 
 # ── Tuneable parameters ───────────────────────────────────────────────────────
-EMA_FAST   = 5     # fast EMA — very responsive on 1m candles
-EMA_SLOW   = 13    # slow EMA — medium-term trend direction
+EMA_FAST   = 8     # wider fast EMA — requires ~8 bars of momentum, avoids single-candle flips
+EMA_SLOW   = 21    # wider slow EMA — genuine medium-term trend reference (Fib 21)
 ADX_PERIOD = 10    # shorter ADX window — reacts faster on 1m
-ADX_MIN    = 15.0  # lower threshold — 1m ranges rarely push ADX above 20
-VOL_MA     = 10    # faster volume average for 1m context
-VOL_MULT   = 0.6   # more permissive — low-vol 1m bars are normal
+ADX_MIN    = 30.0  # minimum trend strength — blocks choppy low-momentum entries
+VOL_MA        = 10    # faster volume average for 1m context
+VOL_MULT      = 0.6   # more permissive — low-vol 1m bars are normal
+SPIKE_ATR_MULT = 1.5  # skip signal if candle range > 1.5× ATR (exhaustion spike)
 
 # Warm-up: need at least this many closed candles before any signal
 _MIN_BARS = max(EMA_SLOW, ADX_PERIOD, VOL_MA) + 5
@@ -76,9 +77,10 @@ class ScalpingStrategy:
 
         row = df.iloc[-1]
 
-        adx_ok = row["adx"]    >= ADX_MIN
-        vol_ok = row["volume"] >= row["vol_avg"] * VOL_MULT
-        cross  = row["cross"]
+        adx_ok   = row["adx"]          >= ADX_MIN
+        vol_ok   = row["volume"]       >= row["vol_avg"] * VOL_MULT
+        spike_ok = row["candle_range"] <= row["atr"] * SPIKE_ATR_MULT
+        cross    = row["cross"]
 
         ema_fast = row["ema_fast"]
         ema_slow = row["ema_slow"]
@@ -90,14 +92,20 @@ class ScalpingStrategy:
         in_uptrend   = ema_fast > ema_slow
         in_downtrend = ema_fast < ema_slow
 
-        if cross == "bull" and adx_ok and vol_ok and in_uptrend:
+        if cross == "bull" and adx_ok and vol_ok and spike_ok and in_uptrend:
             log.info(
                 f"SIGNAL long  |  cross=bull  adx={row['adx']:.1f}  "
                 f"vol={row['volume']:.0f}  vol_avg={row['vol_avg']:.0f}"
             )
             return "long"
 
-        if cross == "bear" and adx_ok and vol_ok and in_downtrend:
+        if not spike_ok:
+            log.debug(
+                f"SPIKE filtered  range={row['candle_range']:.5f}"
+                f"  atr_limit={row['atr'] * SPIKE_ATR_MULT:.5f}"
+            )
+
+        if cross == "bear" and adx_ok and vol_ok and spike_ok and in_downtrend:
             log.info(
                 f"SIGNAL short |  cross=bear  adx={row['adx']:.1f}  "
                 f"vol={row['volume']:.0f}  vol_avg={row['vol_avg']:.0f}"
@@ -171,11 +179,12 @@ def _adx(df: pd.DataFrame, period: int) -> pd.Series:
 def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    df["ema_fast"] = _ema(df["close"], EMA_FAST)
-    df["ema_slow"] = _ema(df["close"], EMA_SLOW)
-    df["atr"]      = _atr(df, cfg.ATR_PERIOD)
-    df["adx"]      = _adx(df, ADX_PERIOD)
-    df["vol_avg"]  = df["volume"].rolling(VOL_MA, min_periods=1).mean()
+    df["ema_fast"]     = _ema(df["close"], EMA_FAST)
+    df["ema_slow"]     = _ema(df["close"], EMA_SLOW)
+    df["atr"]          = _atr(df, cfg.ATR_PERIOD)
+    df["adx"]          = _adx(df, ADX_PERIOD)
+    df["vol_avg"]      = df["volume"].rolling(VOL_MA, min_periods=1).mean()
+    df["candle_range"] = df["high"] - df["low"]
 
     prev_fast = df["ema_fast"].shift(1)
     prev_slow = df["ema_slow"].shift(1)

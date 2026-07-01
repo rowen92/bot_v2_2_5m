@@ -230,18 +230,23 @@ class RiskManager:
 
     # ── Trailing TP helpers ───────────────────────────────────────────────────
 
-    def update_trail(self, pos, mark_price: float) -> bool:
+    def update_trail(self, pos, mark_price: float, live_atr: float | None = None) -> bool:
         """
         Update trailing TP state on `pos` (a Position dataclass).
         Returns True when the trail stop has been hit and we should close.
 
-        Uses ATR-based distances when pos.atr is set (stored at open time),
-        otherwise falls back to fixed TRAIL_ACTIVATE_PCT / TRAIL_CALLBACK_PCT.
+        activate_dist uses pos.atr (frozen at entry) — keeps the activation
+        threshold stable regardless of what the market does after entry.
+        callback_dist uses live_atr (current candle ATR) — adapts to current
+        volatility so a quiet market gets a wider callback and a volatile market
+        gets a tighter one. Falls back to pos.atr if live_atr not available.
         """
-        atr = getattr(pos, "atr", None)
-        if atr and atr > 0:
-            activate_dist = atr * cfg.TRAIL_ACTIVATE_ATR_MULT  # arm after N× ATR in profit (decoupled from SL dist)
-            callback_dist = atr * cfg.SL_ATR_MULT * 0.5         # trail gives back 50% of SL distance — balanced between noise tolerance and profit capture
+        entry_atr    = getattr(pos, "atr", None)
+        callback_atr = live_atr if (live_atr and live_atr > 0) else entry_atr
+
+        if entry_atr and entry_atr > 0:
+            activate_dist = entry_atr   * cfg.TRAIL_ACTIVATE_ATR_MULT  # stable: based on entry conditions
+            callback_dist = callback_atr * cfg.SL_ATR_MULT * 0.75       # dynamic: 75% of SL dist using live ATR
         else:
             activate_dist = pos.entry_price * (cfg.TRAIL_ACTIVATE_PCT / 100)
             callback_dist = pos.entry_price * (cfg.TRAIL_CALLBACK_PCT / 100)

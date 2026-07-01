@@ -40,11 +40,32 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
 
     tlog.log_signal(signal, indicators)   # log every candle (signal=none is useful too)
 
+    # Keep live ATR current so update_trail() uses current volatility,
+    # not the stale ATR frozen at entry time.
+    if indicators.get("atr"):
+        state.live_atr = indicators["atr"]
+
     if signal != "none":
         live_bal = None
         if not cfg.is_paper():
             live_bal = await orders._live_balance(client)
-        if risk.can_trade(state, live_balance=live_bal):
+
+        pos = state.position
+        is_flip = (
+            pos is not None
+            and ((signal == "long"  and pos["side"] == "short") or
+                 (signal == "short" and pos["side"] == "long"))
+        )
+
+        if is_flip:
+            # Opposite signal while in a position — close current and flip.
+            # Only fires if signal passed all filters (ADX, volume, spike, trend).
+            log.info(
+                f"FLIP detected — closing {pos['side'].upper()} to open {signal.upper()}"
+            )
+            await orders.close_position("FLIP", state, client)
+
+        if is_flip or risk.can_trade(state, live_balance=live_bal):
             atr = indicators.get("atr")   # float from strategy snapshot, or None
             await orders.open_position(signal, state, client, atr=atr)
         else:
