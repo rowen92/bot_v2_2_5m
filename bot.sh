@@ -118,7 +118,7 @@ case "$CMD" in
         target="${1:-all}"
         pull_one() {
             local dir; dir=$(resolve_dir "$1")
-            header "$dir  git pull"
+            header "$dir  git pull origin master"
             git -C "${BOTS_ROOT}/$dir" pull
         }
         if [[ "$target" == "all" ]]; then
