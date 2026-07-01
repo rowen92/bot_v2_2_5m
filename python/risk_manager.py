@@ -254,8 +254,8 @@ class RiskManager:
         # Breakeven distance = 1×SL_ATR_MULT × ATR (halfway to trail activation).
         # Once price moves this far in our favour, SL is slid to entry so a
         # reversal before the trail arms costs nothing instead of a full SL hit.
-        if atr and atr > 0:
-            breakeven_dist = atr * cfg.SL_ATR_MULT
+        if entry_atr and entry_atr > 0:
+            breakeven_dist = entry_atr * cfg.SL_ATR_MULT
         else:
             breakeven_dist = pos.entry_price * (cfg.STOP_LOSS_PCT / 100)
 

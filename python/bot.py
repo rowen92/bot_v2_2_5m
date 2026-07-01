@@ -53,15 +53,15 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
         pos = state.position
         is_flip = (
             pos is not None
-            and ((signal == "long"  and pos["side"] == "short") or
-                 (signal == "short" and pos["side"] == "long"))
+            and ((signal == "long"  and pos.side == "short") or
+                 (signal == "short" and pos.side == "long"))
         )
 
         if is_flip:
             # Opposite signal while in a position — close current and flip.
             # Only fires if signal passed all filters (ADX, volume, spike, trend).
             log.info(
-                f"FLIP detected — closing {pos['side'].upper()} to open {signal.upper()}"
+                f"FLIP detected — closing {pos.side.upper()} to open {signal.upper()}"
             )
             await orders.close_position("FLIP", state, client)
 
