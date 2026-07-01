@@ -119,7 +119,7 @@ case "$CMD" in
         pull_one() {
             local dir; dir=$(resolve_dir "$1")
             header "$dir  git pull origin master"
-            git -C "${BOTS_ROOT}/$dir" pull
+            git -C "${BOTS_ROOT}/$dir" pull origin master
         }
         if [[ "$target" == "all" ]]; then
             while IFS= read -r dir; do pull_one "$dir"; done < <(list_bots)
