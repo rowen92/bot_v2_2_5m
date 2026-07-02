@@ -77,7 +77,7 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
 
         if is_flip or risk.can_trade(state, live_balance=live_bal):
             atr = indicators.get("atr")   # float from strategy snapshot, or None
-            await orders.open_position(signal, state, client, atr=atr)
+            await orders.open_position(signal, state, client, atr=atr, strategy=strategy)
         else:
             log.debug(f"SIGNAL={signal.upper()} blocked by can_trade — see risk log above")
 

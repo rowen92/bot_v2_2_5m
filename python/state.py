@@ -44,6 +44,11 @@ class Position:
     # ATR at entry time — used for dynamic trail distances in update_trail()
     atr:             Optional[float] = None
 
+    # Market regime at entry time — governs SL/TP/trail multipliers for this position.
+    # Frozen at open so mid-trade regime changes don't alter the position's risk profile.
+    # Values: 'STRONG_TREND' | 'TREND' | 'CHOP'
+    regime:          str = "TREND"
+
     # Trailing TP state --------------------------------------------------------
     # best_price: highest mark for long, lowest mark for short since entry
     best_price:      float = 0.0   # set to entry_price after open
@@ -176,10 +181,13 @@ class State:
             self.consecutive_sl = 0   # reset streak on any win
         else:
             self.losing_trades += 1
-            if self.last_close_reason == "sl":
+            # Only penalise the streak for a real SL loss, not a breakeven SL
+            # (breakeven SL slides pos.sl_price to entry — fees make pnl slightly
+            # negative but it is not a true directional loss).
+            if self.last_close_reason == "sl" and pnl < -0.01:
                 self.consecutive_sl += 1
             else:
-                # TRAIL_TP closed at a loss — not a clean SL, don't stack penalty
+                # TRAIL_TP at a loss, FLIP, or breakeven SL — don't stack penalty
                 self.consecutive_sl = 0
 
     def daily_loss_pct(self) -> float:

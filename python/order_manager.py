@@ -26,6 +26,7 @@ class OrderManager:
         state: State,
         client: Optional[AsyncClient] = None,
         atr: float | None = None,
+        strategy=None,
     ) -> Optional[Position]:
         """Open a long or short futures position.
 
@@ -45,12 +46,22 @@ class OrderManager:
             # Keep snapshot current so daily_loss_pct() always has a fresh base.
             if balance > 0:
                 state.live_balance_snapshot = balance
-        qty = rm.position_size(entry, balance, state=state, atr=atr)
+        # Classify market regime — drives SL/TP/trail multipliers for this position.
+        # Uses the caller's strategy singleton (which has a warm cached DataFrame).
+        # Falls back to "TREND" if strategy not passed or df not yet warmed up.
+        regime = strategy.market_regime(state) if strategy is not None else "TREND"
+
+        qty = rm.position_size(entry, balance, state=state, atr=atr, regime=regime)
         if qty <= 0:
             log.warning(f"open skipped: position_size=0  balance={balance:.2f}  entry={entry:.4f}")
             return None
-        tp  = rm.tp_price(entry, signal, atr=atr)
-        sl  = rm.sl_price(entry, signal, atr=atr)
+        tp  = rm.tp_price(entry, signal, atr=atr, regime=regime)
+        sl  = rm.sl_price(entry, signal, atr=atr, regime=regime)
+
+        log.info(
+            f"open_position  regime={regime}  signal={signal}  "
+            f"entry={entry:.4f}  tp={tp:.4f}  sl={sl:.4f}  qty={qty}"
+        )
 
         if cfg.is_paper():
             pos = self._paper_open(signal, entry, qty, tp, sl, state)
@@ -60,8 +71,9 @@ class OrderManager:
         if pos:
             pos.best_price = entry  # initialise trailing high-water-mark
             pos.atr        = atr    # stored so update_trail() can use ATR-based distances
+            pos.regime     = regime  # frozen at entry — governs trail for the life of this position
             state.position = pos
-            tlog.log_open(signal, entry, qty, tp, sl, cfg.TRADING_MODE)
+            tlog.log_open(signal, entry, qty, tp, sl, cfg.TRADING_MODE, regime=regime)
 
         return pos
 
@@ -280,7 +292,7 @@ class OrderManager:
                 symbol=symbol,
                 side=close_side,
                 type="TAKE_PROFIT_MARKET",
-                stopPrice=round(rm.tp_price(actual_entry, signal), cfg.PRICE_PRECISION),
+                stopPrice=round(tp, cfg.PRICE_PRECISION),
                 closePosition=True,
                 timeInForce="GTE_GTC",
             )
@@ -295,7 +307,7 @@ class OrderManager:
                 symbol=symbol,
                 side=close_side,
                 type="STOP_MARKET",
-                stopPrice=round(rm.sl_price(actual_entry, signal), cfg.PRICE_PRECISION),
+                stopPrice=round(sl, cfg.PRICE_PRECISION),
                 closePosition=True,
                 timeInForce="GTE_GTC",
             )
@@ -309,8 +321,8 @@ class OrderManager:
             side=signal,
             entry_price=actual_entry,
             qty=qty,
-            tp_price=rm.tp_price(actual_entry, signal),
-            sl_price=rm.sl_price(actual_entry, signal),
+            tp_price=tp,
+            sl_price=sl,
             order_id=order_id,
         )
 

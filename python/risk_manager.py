@@ -2,10 +2,12 @@
 risk_manager.py – Position sizing and pre-trade risk checks.
 
 Position size formula (risk-based):
-    risk_usdt = balance * RISK_PER_TRADE_PCT / 100
-    sl_distance = entry_price * STOP_LOSS_PCT / 100
-    qty = (risk_usdt * LEVERAGE) / sl_distance
+    risk_usdt   = balance * RISK_PER_TRADE_PCT / 100
+    sl_distance = atr * SL_ATR_MULT          # or entry * STOP_LOSS_PCT / 100 as fallback
+    qty         = risk_usdt / sl_distance
 
+Leverage is applied by the exchange on the margin side — do NOT multiply here
+or the position becomes leverage× too large.
 The position is sized so that if the SL is hit, you lose exactly
 RISK_PER_TRADE_PCT % of your balance (before leverage).
 """
@@ -145,26 +147,53 @@ class RiskManager:
 
     # ── Position sizing ───────────────────────────────────────────────────────
 
+    # ── Regime-based multipliers ──────────────────────────────────────────────
+
+    _REGIME_PARAMS: dict[str, dict] = {
+        #              sl_mult  tp_mult  trail_act  trail_cb
+        # STRONG_TREND: ADX>=50 + strong EMA8 vs EMA100 separation
+        #   Wide SL to breathe. Trail arms at 3.0×ATR (callback_dist = 2.5×0.60 = 1.5×ATR),
+        #   giving entry + 3.0 - 1.5 = entry + 1.5×ATR as the first trail_stop — comfortably
+        #   in profit. trail_act=2.0 was too early: callback_dist consumed 75% of activate_dist
+        #   meaning any normal retrace killed the position the moment the trail armed.
+        "STRONG_TREND": {"sl": 2.5, "tp": 5.0, "trail_act": 3.0, "trail_cb": 0.60},
+        # TREND: ADX 45-49 — confirmed momentum, not exceptional
+        #   Normal SL, trail arms at 3.5×ATR (just before fixed TP at 4×), 0.75 callback.
+        "TREND":        {"sl": 2.0, "tp": 4.0, "trail_act": 3.5, "trail_cb": 0.75},
+        # CHOP: ADX 40-44 — marginal crossover entry, weaker momentum
+        #   Tighter SL + TP for a quick scalp. trail_act=4.0 > tp=3.0, so trail
+        #   intentionally never fires — fixed TP always exits first. Trail is dead
+        #   by design here: we want a clean fixed-target scalp, not a open-ended trail
+        #   on a weak momentum signal.
+        "CHOP":         {"sl": 1.5, "tp": 3.0, "trail_act": 4.0, "trail_cb": 0.50},
+    }
+
+    def regime_params(self, regime: str) -> dict:
+        """Return SL/TP/trail multipliers for the given market regime."""
+        return self._REGIME_PARAMS.get(regime, self._REGIME_PARAMS["TREND"])
+
     def position_size(
         self,
         entry_price: float,
         balance: float,
         state: State | None = None,
         atr: float | None = None,
+        regime: str = "TREND",
     ) -> float:
         """
         Calculate the position quantity in base asset (WLD).
         Returned value is already rounded to 1 decimal (Binance WLDUSDT step).
 
-        When `atr` is provided the SL distance is ATR-based (SL_ATR_MULT × ATR),
-        keeping position size proportional to current volatility.
+        When `atr` is provided the SL distance is ATR-based (sl_mult × ATR),
+        where sl_mult is chosen based on the current market regime.
         Falls back to fixed STOP_LOSS_PCT when ATR is unavailable.
         """
         risk_pct  = self._dynamic_risk_pct(state) if state else cfg.RISK_PER_TRADE_PCT
         risk_usdt = balance * (risk_pct / 100)
 
         if atr and atr > 0:
-            sl_distance = atr * cfg.SL_ATR_MULT
+            sl_mult     = self.regime_params(regime)["sl"]
+            sl_distance = atr * sl_mult
         else:
             sl_distance = entry_price * (cfg.STOP_LOSS_PCT / 100)
 
@@ -192,24 +221,28 @@ class RiskManager:
 
     # ── TP / SL price levels ──────────────────────────────────────────────────
 
-    def tp_price(self, entry: float, side: str, atr: float | None = None) -> float:
+    def tp_price(self, entry: float, side: str, atr: float | None = None, regime: str = "TREND") -> float:
         """
-        Take-profit price.  Uses ATR-based distance (TP_ATR_MULT × ATR) when
-        available; falls back to fixed TAKE_PROFIT_PCT otherwise.
+        Take-profit price.  Uses ATR-based distance (tp_mult × ATR) when
+        available, where tp_mult is chosen by market regime.
+        Falls back to fixed TAKE_PROFIT_PCT otherwise.
         """
         if atr and atr > 0:
-            dist = atr * cfg.TP_ATR_MULT
+            tp_mult = self.regime_params(regime)["tp"]
+            dist    = atr * tp_mult
         else:
             dist = entry * (cfg.TAKE_PROFIT_PCT / 100)
         return entry + dist if side == "long" else entry - dist
 
-    def sl_price(self, entry: float, side: str, atr: float | None = None) -> float:
+    def sl_price(self, entry: float, side: str, atr: float | None = None, regime: str = "TREND") -> float:
         """
-        Stop-loss price.  Uses ATR-based distance (SL_ATR_MULT × ATR) when
-        available; falls back to fixed STOP_LOSS_PCT otherwise.
+        Stop-loss price.  Uses ATR-based distance (sl_mult × ATR) when
+        available, where sl_mult is chosen by market regime.
+        Falls back to fixed STOP_LOSS_PCT otherwise.
         """
         if atr and atr > 0:
-            dist = atr * cfg.SL_ATR_MULT
+            sl_mult = self.regime_params(regime)["sl"]
+            dist    = atr * sl_mult
         else:
             dist = entry * (cfg.STOP_LOSS_PCT / 100)
         return entry - dist if side == "long" else entry + dist
@@ -235,29 +268,37 @@ class RiskManager:
         Update trailing TP state on `pos` (a Position dataclass).
         Returns True when the trail stop has been hit and we should close.
 
-        activate_dist uses pos.atr (frozen at entry) — keeps the activation
-        threshold stable regardless of what the market does after entry.
-        callback_dist uses live_atr (current candle ATR) — adapts to current
-        volatility so a quiet market gets a wider callback and a volatile market
-        gets a tighter one. Falls back to pos.atr if live_atr not available.
+        activate_dist uses pos.atr (frozen at entry) + regime trail_act mult —
+        keeps the activation threshold stable regardless of what the market does after entry.
+        callback_dist uses live_atr × sl_mult × trail_cb — adapts to current
+        volatility: a volatile market (high live_atr) gets a wider callback so
+        normal price swings don't shake the position out; a quiet market (low
+        live_atr) gets a tighter callback to lock gains quickly.
+        Falls back to pos.atr if live_atr not available.
+
+        pos.regime is frozen at entry — the regime that decided to open the trade
+        also governs how it trails, regardless of regime changes while in the position.
         """
         entry_atr    = getattr(pos, "atr", None)
         callback_atr = live_atr if (live_atr and live_atr > 0) else entry_atr
+        regime       = getattr(pos, "regime", "TREND")
+        rp           = self.regime_params(regime)
 
         if entry_atr and entry_atr > 0:
-            activate_dist = entry_atr   * cfg.TRAIL_ACTIVATE_ATR_MULT  # stable: based on entry conditions
-            callback_dist = callback_atr * cfg.SL_ATR_MULT * 0.75       # dynamic: 75% of SL dist using live ATR
+            activate_dist = entry_atr   * rp["trail_act"]                # regime-based activation
+            callback_dist = callback_atr * rp["sl"] * rp["trail_cb"]     # regime sl_mult × trail_cb
         else:
             activate_dist = pos.entry_price * (cfg.TRAIL_ACTIVATE_PCT / 100)
             callback_dist = pos.entry_price * (cfg.TRAIL_CALLBACK_PCT / 100)
 
-        # Breakeven distance = 1×SL_ATR_MULT × ATR (halfway to trail activation).
-        # Once price moves this far in our favour, SL is slid to entry so a
-        # reversal before the trail arms costs nothing instead of a full SL hit.
+        # Breakeven distance = 0.5 × sl_dist — slides SL to entry once price
+        # has moved halfway to the full SL distance in our favour.
+        # Using the full sl_dist here would mean breakeven only triggers at the
+        # same tick the SL would fire, making it useless.
         if entry_atr and entry_atr > 0:
-            breakeven_dist = entry_atr * cfg.SL_ATR_MULT
+            breakeven_dist = entry_atr * rp["sl"] * 0.5
         else:
-            breakeven_dist = pos.entry_price * (cfg.STOP_LOSS_PCT / 100)
+            breakeven_dist = pos.entry_price * (cfg.STOP_LOSS_PCT / 100) * 0.5
 
         if pos.side == "long":
             # Track the highest price seen

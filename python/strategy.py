@@ -11,10 +11,10 @@ Entry logic:
     when EMA alignment + ADX still strong, no fresh cross required
 
 Signal:
-  - 'long'  — cross=bull + ADX>30 + vol + no spike + EMA8>EMA21 + close>EMA100
-           OR — continuation: EMA8>EMA21 + ADX>45 + vol + no spike + close>EMA100
-  - 'short' — cross=bear + ADX>30 + vol + no spike + EMA8<EMA21 + close<EMA100
-           OR — continuation: EMA8<EMA21 + ADX>45 + vol + no spike + close<EMA100
+  - 'long'  — cross=bull + ADX>=40 + vol + no spike + EMA8>EMA21 + close>EMA100
+           OR — continuation: EMA8>EMA21 + ADX>=50 + vol + no spike + close>EMA100
+  - 'short' — cross=bear + ADX>=40 + vol + no spike + EMA8<EMA21 + close<EMA100
+           OR — continuation: EMA8<EMA21 + ADX>=50 + vol + no spike + close<EMA100
   - 'none'  otherwise
 
 The trailing stop in order_manager rides the position as far as the trend goes.
@@ -54,9 +54,10 @@ SPIKE_VOL_MULT     = 4.0  # spike is "massive" if volume > 4× average
 class ScalpingStrategy:
     """Trend-following strategy using EMA crossover + ADX + volume + EMA100 bias."""
 
-    _last_df_hash: Optional[int] = None
-    _cached_df: Optional[pd.DataFrame] = None
-    _spike_lockout_remaining: int = 0  # candles left in post-spike lockout
+    def __init__(self) -> None:
+        self._last_df_hash: Optional[int] = None
+        self._cached_df: Optional[pd.DataFrame] = None
+        self._spike_lockout_remaining: int = 0  # candles left in post-spike lockout
 
     def indicator_snapshot(self, state: State) -> Optional[dict]:
         """
@@ -82,6 +83,59 @@ class ScalpingStrategy:
             "cross":     row["cross"],   # 'bull' | 'bear' | 'none'
             "close":     round(row["close"], cfg.PRICE_PRECISION),
         }
+
+    def market_regime(self, state: State) -> str:
+        """
+        Classify current market condition using EMA + ADX.
+        Returns: 'STRONG_TREND' | 'TREND' | 'CHOP'
+
+        Used by risk_manager to select dynamic SL / TP / trail multipliers.
+
+        STRONG_TREND — ADX >= 50 and EMA8 is at least 1.5×ATR away from EMA100
+                       → wide SL to breathe, trail activates sooner, tight callback
+        TREND        — ADX 45-49 and EMA8/21 clearly aligned
+                       → normal SL and trail settings
+        CHOP         — ADX < 45 (marginal momentum — crossover entries at ADX 40-44
+                       still pass get_signal but get tighter SL/TP to reflect the
+                       weaker momentum confirmation)
+                       → tighter SL, trail activates later, smaller callback
+
+        Boundary alignment with get_signal:
+          ADX_MIN=40 (crossover entry floor) → entries at ADX 40-44 → CHOP params
+          ADX 45-49                          → entries here        → TREND params
+          ADX >= 50 (continuation floor)     → entries here        → STRONG_TREND (if ema_sep ok)
+        """
+        df = self._cached_df
+        if df is None or df.empty:
+            return "CHOP"  # safe default while warming up
+
+        row       = df.iloc[-1]
+        adx       = row["adx"]
+        atr       = row["atr"]
+        ema_fast  = row["ema_fast"]
+        ema_slow  = row["ema_slow"]   # used for ema_aligned (mirrors get_signal's ema_gap_ok)
+        ema_trend = row["ema_trend"]
+
+        close          = row["close"]
+        ema_separation = abs(ema_fast - ema_trend)        # EMA8 distance from EMA100
+        # Mirror the same gap check used in get_signal: price must be >0.5×ATR
+        # from EMA21 — if it isn't, the market is at equilibrium (choppy).
+        ema_aligned = abs(close - ema_slow) > 0.5 * atr
+
+        if adx >= 50 and ema_separation >= 1.5 * atr:
+            regime = "STRONG_TREND"
+        elif adx >= 45 and ema_aligned:
+            regime = "TREND"
+        else:
+            # ADX 40-44: valid crossover signal but marginal momentum → tighter params
+            # ADX < 40: no signal fires anyway, but safe default while warming up
+            regime = "CHOP"
+
+        log.debug(
+            f"market_regime={regime}  adx={adx:.1f}  "
+            f"ema_sep={ema_separation:.5f}  atr={atr:.5f}  ema_aligned={ema_aligned}"
+        )
+        return regime
 
     def get_signal(self, state: State) -> str:
         """Return 'long', 'short', or 'none'. Reuses cached DataFrame."""
