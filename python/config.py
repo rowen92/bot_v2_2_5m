@@ -66,8 +66,34 @@ class Config:
     # trade develops. 2.0× ATR gives enough breathing room while keeping the
     # same dollar risk (position size shrinks proportionally via position_size()).
     # TP scaled to 4.0× ATR to maintain the 2:1 TP:SL ratio.
-    SL_ATR_MULT: float         = _float("SL_ATR_MULT", 2.0)
-    TP_ATR_MULT: float         = _float("TP_ATR_MULT", 4.0)   # TP:SL ratio = 2:1
+    # NOTE: these are fallback-only when ATR=None. Regime params below take over
+    # at runtime once the strategy has warmed up.
+    SL_ATR_MULT: float         = _float('SL_ATR_MULT', 2.0)
+    TP_ATR_MULT: float         = _float('TP_ATR_MULT', 4.0)   # TP:SL ratio = 2:1
+
+    # ── Regime-based multipliers (override SL/TP/trail per market condition) ───
+    # CHOP       — ADX 40-44: marginal crossover signal, weak momentum
+    #              trail_act > tp → trail intentionally never fires (fixed-TP scalp)
+    # TREND      — ADX 45-49: confirmed momentum, normal settings
+    # STRONG_TREND — ADX ≥ 50 + strong EMA separation: high-conviction trend
+    #
+    # trail_cb: fraction of sl_mult used as callback distance
+    #   callback_dist = live_atr × sl_mult × trail_cb
+    #   e.g. TREND: 2.0 × 0.75 = 1.5×ATR callback
+    CHOP_SL_MULT:   float = _float('CHOP_SL_MULT',   1.5)
+    CHOP_TP_MULT:   float = _float('CHOP_TP_MULT',   3.0)
+    CHOP_TRAIL_ACT: float = _float('CHOP_TRAIL_ACT', 4.0)   # > tp → trail never fires
+    CHOP_TRAIL_CB:  float = _float('CHOP_TRAIL_CB',  0.50)
+
+    TREND_SL_MULT:   float = _float('TREND_SL_MULT',   2.0)
+    TREND_TP_MULT:   float = _float('TREND_TP_MULT',   4.0)
+    TREND_TRAIL_ACT: float = _float('TREND_TRAIL_ACT', 3.5)
+    TREND_TRAIL_CB:  float = _float('TREND_TRAIL_CB',  0.75)
+
+    STRONG_TREND_SL_MULT:   float = _float('STRONG_TREND_SL_MULT',   2.5)
+    STRONG_TREND_TP_MULT:   float = _float('STRONG_TREND_TP_MULT',   5.0)
+    STRONG_TREND_TRAIL_ACT: float = _float('STRONG_TREND_TRAIL_ACT', 3.0)
+    STRONG_TREND_TRAIL_CB:  float = _float('STRONG_TREND_TRAIL_CB',  0.60)
 
     # ── Fixed-% fallback (used only when ATR is unavailable) ──────────────────
     TAKE_PROFIT_PCT: float     = _float("TAKE_PROFIT_PCT", 0.40)
@@ -84,16 +110,8 @@ class Config:
     TRAIL_ACTIVATE_PCT: float  = _float("TRAIL_ACTIVATE_PCT", 0.20)
     TRAIL_CALLBACK_PCT: float  = _float("TRAIL_CALLBACK_PCT", 0.10)
 
-    # ATR-based trail activation (used when ATR is available, preferred over fixed %).
-    # Price must move TRAIL_ACTIVATE_ATR_MULT × ATR in your favour before the
-    # trail arms. Kept higher than SL_ATR_MULT so a brief retest near entry
-    # doesn't arm the trail prematurely and close before the real move develops.
-    # e.g. ATR=0.00091, mult=2.0 → trail arms only after 0.00182 move (~2× SL dist)
-    # Raised from 2.0 → 3.0: trail only arms after a real move (3× ATR).
-    # At 2.0 the trail was activating too close to entry, then giving back
-    # almost all the profit via callback — resulting in R:R < 0.5:1.
-    # With 3.0 activation and tighter callback (0.4 in risk_manager),
-    # minimum guaranteed profit = 3×ATR - 0.8×ATR = 2.2×ATR → R:R ≈ 1.1:1
+    # Fallback-only — used by update_trail() when pos.atr is None (pre-warmup edge case).
+    # At runtime, trail activation is controlled by CHOP/TREND/STRONG_TREND_TRAIL_ACT above.
     TRAIL_ACTIVATE_ATR_MULT: float = _float("TRAIL_ACTIVATE_ATR_MULT", 3.5)
 
     # ── Signal cooldown ────────────────────────────────────────────────────────

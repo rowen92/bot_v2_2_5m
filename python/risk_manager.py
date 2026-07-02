@@ -149,28 +149,32 @@ class RiskManager:
 
     # ── Regime-based multipliers ──────────────────────────────────────────────
 
-    _REGIME_PARAMS: dict[str, dict] = {
-        #              sl_mult  tp_mult  trail_act  trail_cb
-        # STRONG_TREND: ADX>=50 + strong EMA8 vs EMA100 separation
-        #   Wide SL to breathe. Trail arms at 3.0×ATR (callback_dist = 2.5×0.60 = 1.5×ATR),
-        #   giving entry + 3.0 - 1.5 = entry + 1.5×ATR as the first trail_stop — comfortably
-        #   in profit. trail_act=2.0 was too early: callback_dist consumed 75% of activate_dist
-        #   meaning any normal retrace killed the position the moment the trail armed.
-        "STRONG_TREND": {"sl": 2.5, "tp": 5.0, "trail_act": 3.0, "trail_cb": 0.60},
-        # TREND: ADX 45-49 — confirmed momentum, not exceptional
-        #   Normal SL, trail arms at 3.5×ATR (just before fixed TP at 4×), 0.75 callback.
-        "TREND":        {"sl": 2.0, "tp": 4.0, "trail_act": 3.5, "trail_cb": 0.75},
-        # CHOP: ADX 40-44 — marginal crossover entry, weaker momentum
-        #   Tighter SL + TP for a quick scalp. trail_act=4.0 > tp=3.0, so trail
-        #   intentionally never fires — fixed TP always exits first. Trail is dead
-        #   by design here: we want a clean fixed-target scalp, not a open-ended trail
-        #   on a weak momentum signal.
-        "CHOP":         {"sl": 1.5, "tp": 3.0, "trail_act": 4.0, "trail_cb": 0.50},
-    }
-
     def regime_params(self, regime: str) -> dict:
-        """Return SL/TP/trail multipliers for the given market regime."""
-        return self._REGIME_PARAMS.get(regime, self._REGIME_PARAMS["TREND"])
+        """Return SL/TP/trail multipliers for the given market regime.
+        All values are read from cfg so they can be tuned per-bot via .env
+        without touching code.
+        """
+        params = {
+            "STRONG_TREND": {
+                "sl":        cfg.STRONG_TREND_SL_MULT,
+                "tp":        cfg.STRONG_TREND_TP_MULT,
+                "trail_act": cfg.STRONG_TREND_TRAIL_ACT,
+                "trail_cb":  cfg.STRONG_TREND_TRAIL_CB,
+            },
+            "TREND": {
+                "sl":        cfg.TREND_SL_MULT,
+                "tp":        cfg.TREND_TP_MULT,
+                "trail_act": cfg.TREND_TRAIL_ACT,
+                "trail_cb":  cfg.TREND_TRAIL_CB,
+            },
+            "CHOP": {
+                "sl":        cfg.CHOP_SL_MULT,
+                "tp":        cfg.CHOP_TP_MULT,
+                "trail_act": cfg.CHOP_TRAIL_ACT,
+                "trail_cb":  cfg.CHOP_TRAIL_CB,
+            },
+        }
+        return params.get(regime, params["TREND"])
 
     def position_size(
         self,
