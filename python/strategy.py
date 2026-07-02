@@ -36,9 +36,9 @@ EMA_FAST      = 8      # fast EMA — momentum detection
 EMA_SLOW      = 21     # slow EMA — medium-term trend reference (Fib 21)
 EMA_TREND     = 100    # long-term bias — only long above, only short below
 ADX_PERIOD    = 10     # shorter ADX window — reacts faster on 1m
-ADX_MIN       = 30.0   # minimum ADX for crossover entries
-ADX_TREND_MIN = 45.0   # higher ADX required for trend-continuation entries
-ADX_SLOPE_BARS = 3     # ADX must be rising over this many bars (slope filter)
+ADX_MIN       = 40.0   # minimum ADX for crossover entries (raised from 30 — filters marginal momentum)
+ADX_TREND_MIN = 50.0   # higher ADX required for trend-continuation entries (raised from 45)
+ADX_SLOPE_BARS = 2     # ADX must be rising over this many bars (tightened from 3 — catches momentum exhaustion faster)
 VOL_MA        = 10     # volume average window
 VOL_MULT      = 0.6    # volume must be at least 60% of average
 SPIKE_ATR_MULT = 1.5   # skip signal if candle range > 1.5× ATR (exhaustion spike)
@@ -123,6 +123,13 @@ class ScalpingStrategy:
         bias_long  = close > ema_trend
         bias_short = close < ema_trend
 
+        # EMA21 distance guard: require price to be at least 0.5× ATR away from
+        # EMA_SLOW before entering. Entries right at EMA21 are equilibrium — the
+        # market has not yet committed to a direction and SL hits are frequent.
+        atr_val = row["atr"]
+        ema_gap_ok_long  = (close - ema_slow) >  0.5 * atr_val
+        ema_gap_ok_short = (ema_slow - close) >  0.5 * atr_val
+
         if not spike_ok:
             log.debug(
                 f"SPIKE filtered  range={row['candle_range']:.5f}"
@@ -145,14 +152,14 @@ class ScalpingStrategy:
             return "none"
 
         # ── 1. Crossover entries (fresh cross signal) ─────────────────────────
-        if cross == "bull" and adx_ok and vol_ok and spike_ok and in_uptrend and bias_long:
+        if cross == "bull" and adx_ok and vol_ok and spike_ok and in_uptrend and bias_long and ema_gap_ok_long:
             log.info(
                 f"SIGNAL long  |  cross=bull  adx={row['adx']:.1f}  "
                 f"vol={row['volume']:.0f}  ema100={ema_trend:.4f}  close={close:.4f}"
             )
             return "long"
 
-        if cross == "bear" and adx_ok and vol_ok and spike_ok and in_downtrend and bias_short:
+        if cross == "bear" and adx_ok and vol_ok and spike_ok and in_downtrend and bias_short and ema_gap_ok_short:
             log.info(
                 f"SIGNAL short |  cross=bear  adx={row['adx']:.1f}  "
                 f"vol={row['volume']:.0f}  ema100={ema_trend:.4f}  close={close:.4f}"
@@ -161,16 +168,16 @@ class ScalpingStrategy:
 
         # ── 2. Trend continuation entries (no fresh cross needed) ─────────────
         # Re-enters after SL+cooldown when trend is still strongly intact.
-        # Requires ADX >= 45 (vs 30 for crossover) to avoid choppy re-entries.
+        # Requires ADX >= 50 (vs 40 for crossover) to avoid choppy re-entries.
         # EMA100 bias still enforced — never trade against long-term trend.
-        if in_uptrend and adx_trend_ok and vol_ok and spike_ok and bias_long:
+        if in_uptrend and adx_trend_ok and vol_ok and spike_ok and bias_long and ema_gap_ok_long:
             log.info(
                 f"SIGNAL long  |  continuation  adx={row['adx']:.1f}  "
                 f"vol={row['volume']:.0f}  ema100={ema_trend:.4f}  close={close:.4f}"
             )
             return "long"
 
-        if in_downtrend and adx_trend_ok and vol_ok and spike_ok and bias_short:
+        if in_downtrend and adx_trend_ok and vol_ok and spike_ok and bias_short and ema_gap_ok_short:
             log.info(
                 f"SIGNAL short |  continuation  adx={row['adx']:.1f}  "
                 f"vol={row['volume']:.0f}  ema100={ema_trend:.4f}  close={close:.4f}"

@@ -94,7 +94,7 @@ class Config:
     # almost all the profit via callback — resulting in R:R < 0.5:1.
     # With 3.0 activation and tighter callback (0.4 in risk_manager),
     # minimum guaranteed profit = 3×ATR - 0.8×ATR = 2.2×ATR → R:R ≈ 1.1:1
-    TRAIL_ACTIVATE_ATR_MULT: float = _float("TRAIL_ACTIVATE_ATR_MULT", 3.0)
+    TRAIL_ACTIVATE_ATR_MULT: float = _float("TRAIL_ACTIVATE_ATR_MULT", 3.5)
 
     # ── Signal cooldown ────────────────────────────────────────────────────────
     # Minimum closed candles to wait after any trade close before re-entering
