@@ -38,6 +38,7 @@ EMA_TREND     = 100    # long-term bias — only long above, only short below
 ADX_PERIOD    = 10     # shorter ADX window — reacts faster on 1m
 ADX_MIN       = 30.0   # minimum ADX for crossover entries
 ADX_TREND_MIN = 45.0   # higher ADX required for trend-continuation entries
+ADX_SLOPE_BARS = 3     # ADX must be rising over this many bars (slope filter)
 VOL_MA        = 10     # volume average window
 VOL_MULT      = 0.6    # volume must be at least 60% of average
 SPIKE_ATR_MULT = 1.5   # skip signal if candle range > 1.5× ATR (exhaustion spike)
@@ -46,11 +47,16 @@ SPIKE_ATR_MULT = 1.5   # skip signal if candle range > 1.5× ATR (exhaustion spi
 _MIN_BARS = max(EMA_SLOW, ADX_PERIOD, VOL_MA) + 5
 
 
+SPIKE_LOCKOUT_BARS = 2   # candles to block entries after a massive spike
+SPIKE_VOL_MULT     = 4.0  # spike is "massive" if volume > 4× average
+
+
 class ScalpingStrategy:
     """Trend-following strategy using EMA crossover + ADX + volume + EMA100 bias."""
 
     _last_df_hash: Optional[int] = None
     _cached_df: Optional[pd.DataFrame] = None
+    _spike_lockout_remaining: int = 0  # candles left in post-spike lockout
 
     def indicator_snapshot(self, state: State) -> Optional[dict]:
         """
@@ -85,8 +91,21 @@ class ScalpingStrategy:
 
         row = df.iloc[-1]
 
-        adx_ok       = row["adx"]          >= ADX_MIN
-        adx_trend_ok = row["adx"]          >= ADX_TREND_MIN
+        # ADX slope: require ADX to be rising over last ADX_SLOPE_BARS candles.
+        # Prevents entries when momentum is exhausting (high but falling ADX).
+        if len(df) > ADX_SLOPE_BARS:
+            adx_rising = row["adx"] > df["adx"].iloc[-1 - ADX_SLOPE_BARS]
+        else:
+            adx_rising = True  # not enough history — don't block
+
+        if not adx_rising:
+            log.debug(
+                f"ADX SLOPE filtered  adx={row['adx']:.1f}"
+                f"  adx_{ADX_SLOPE_BARS}bars_ago={df['adx'].iloc[-1 - ADX_SLOPE_BARS]:.1f}"
+            )
+
+        adx_ok       = (row["adx"] >= ADX_MIN)       and adx_rising
+        adx_trend_ok = (row["adx"] >= ADX_TREND_MIN) and adx_rising
         vol_ok       = row["volume"]       >= row["vol_avg"] * VOL_MULT
         spike_ok     = row["candle_range"] <= row["atr"] * SPIKE_ATR_MULT
         cross        = row["cross"]
@@ -109,6 +128,21 @@ class ScalpingStrategy:
                 f"SPIKE filtered  range={row['candle_range']:.5f}"
                 f"  atr_limit={row['atr'] * SPIKE_ATR_MULT:.5f}"
             )
+
+        # Massive volume spike lockout: if a candle had vol > 4× average,
+        # block new entries for SPIKE_LOCKOUT_BARS candles — direction is
+        # unreliable immediately after an extreme spike.
+        vol_avg = row["vol_avg"] if row["vol_avg"] > 0 else 1
+        if row["volume"] > vol_avg * SPIKE_VOL_MULT:
+            self._spike_lockout_remaining = SPIKE_LOCKOUT_BARS
+            log.debug(
+                f"SPIKE LOCKOUT set  vol={row['volume']:.0f}"
+                f"  avg={vol_avg:.0f}  lockout={SPIKE_LOCKOUT_BARS} bars"
+            )
+        elif self._spike_lockout_remaining > 0:
+            self._spike_lockout_remaining -= 1
+            log.debug(f"SPIKE LOCKOUT active  remaining={self._spike_lockout_remaining}")
+            return "none"
 
         # ── 1. Crossover entries (fresh cross signal) ─────────────────────────
         if cross == "bull" and adx_ok and vol_ok and spike_ok and in_uptrend and bias_long:

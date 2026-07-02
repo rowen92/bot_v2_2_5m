@@ -60,10 +60,20 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
         if is_flip:
             # Opposite signal while in a position — close current and flip.
             # Only fires if signal passed all filters (ADX, volume, spike, trend).
-            log.info(
-                f"FLIP detected — closing {pos.side.upper()} to open {signal.upper()}"
-            )
-            await orders.close_position("FLIP", state, client)
+            # Guard: skip the FLIP if ADX is below 40 or declining (choppy reversal risk).
+            adx_now   = indicators.get("adx", 0)
+            adx_ok_flip = adx_now >= 40
+            if not adx_ok_flip:
+                log.debug(
+                    f"FLIP suppressed  adx={adx_now:.1f} < 40  "
+                    f"(choppy market — not reversing)"
+                )
+                is_flip = False
+            else:
+                log.info(
+                    f"FLIP detected — closing {pos.side.upper()} to open {signal.upper()}"
+                )
+                await orders.close_position("FLIP", state, client)
 
         if is_flip or risk.can_trade(state, live_balance=live_bal):
             atr = indicators.get("atr")   # float from strategy snapshot, or None
