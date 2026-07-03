@@ -39,17 +39,16 @@ ADX_PERIOD    = 10     # shorter ADX window — reacts faster on 1m
 ADX_MIN       = 40.0   # minimum ADX for crossover entries (raised from 30 — filters marginal momentum)
 ADX_TREND_MIN = 50.0   # higher ADX required for trend-continuation entries (raised from 45)
 ADX_SLOPE_BARS = 2     # ADX must be rising over this many bars (tightened from 3 — catches momentum exhaustion faster)
+ADX_STRONG     = 45.0  # above this level, skip slope check — spike-induced ADX drops are noise, not exhaustion
 EMA_TREND_SLOPE_BARS = 5  # EMA100 must be moving in trade direction over this many bars
 VOL_MA        = 10     # volume average window
 VOL_MULT      = 0.6    # volume must be at least 60% of average
-SPIKE_ATR_MULT = 1.5   # skip signal if candle range > 1.5× ATR (exhaustion spike)
+SPIKE_ATR_MULT     = 1.5  # skip signal if candle range > 1.5× ATR (exhaustion spike)
+SPIKE_LOCKOUT_BARS = 2    # candles to block entries after a massive volume spike
+SPIKE_VOL_MULT     = 4.0  # spike is "massive" if volume > 4× average
 
 # Warm-up: need at least this many closed candles before any signal
 _MIN_BARS = max(EMA_SLOW, ADX_PERIOD, VOL_MA) + 5
-
-
-SPIKE_LOCKOUT_BARS = 2   # candles to block entries after a massive spike
-SPIKE_VOL_MULT     = 4.0  # spike is "massive" if volume > 4× average
 
 
 class ScalpingStrategy:
@@ -156,8 +155,11 @@ class ScalpingStrategy:
 
         # ADX slope: require ADX to be rising over last ADX_SLOPE_BARS candles.
         # Prevents entries when momentum is exhausting (high but falling ADX).
+        # Exception: when ADX is already above ADX_STRONG (45), a post-spike dip
+        # in ADX is noise — the trend is clearly intact so skip the slope check.
         if len(df) > ADX_SLOPE_BARS:
-            adx_rising = row["adx"] > df["adx"].iloc[-1 - ADX_SLOPE_BARS]
+            adx_prev   = df["adx"].iloc[-1 - ADX_SLOPE_BARS]
+            adx_rising = (row["adx"] >= ADX_STRONG) or (row["adx"] > adx_prev)
         else:
             adx_rising = True  # not enough history — don't block
 
@@ -203,8 +205,8 @@ class ScalpingStrategy:
             ema100_rising  = ema_trend > ema_trend_prev
             ema100_falling = ema_trend < ema_trend_prev
             # flat (exact equality) → both are False → blocks all directions.
-            # Log only when something is actually blocked, same pattern as ADX SLOPE filtered.
-            if not ema100_rising or not ema100_falling:
+            # Log only when EMA100 is flat (blocks both longs and shorts).
+            if not ema100_rising and not ema100_falling:
                 log.debug(
                     f"EMA100 SLOPE  rising={ema100_rising}  falling={ema100_falling}"
                     f"  ema100={ema_trend:.5f}  prev={ema_trend_prev:.5f}"
