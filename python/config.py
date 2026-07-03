@@ -95,6 +95,15 @@ class Config:
     STRONG_TREND_TRAIL_ACT: float = _float('STRONG_TREND_TRAIL_ACT', 3.0)
     STRONG_TREND_TRAIL_CB:  float = _float('STRONG_TREND_TRAIL_CB',  0.60)
 
+    # ── Breakeven SL threshold multiplier ─────────────────────────────────────
+    # Breakeven SL slides pos.sl_price to entry once:
+    #   best_price >= entry + (entry_atr × sl_mult × BREAKEVEN_ATR_MULT)
+    # Default: 0.5 — triggers at half the SL distance (suits BTC/ETH/WLD).
+    # DOGE override (.env): 1.0 — requires a full SL-distance move before
+    # breakeven fires. On low-volatility coins (ATR ~7e-05) the 0.5× threshold
+    # equals ~1 ATR of pure tick noise and fires within seconds (trade #1: 42s).
+    BREAKEVEN_ATR_MULT: float = _float('BREAKEVEN_ATR_MULT', 0.5)
+
     # ── Fixed-% fallback (used only when ATR is unavailable) ──────────────────
     TAKE_PROFIT_PCT: float     = _float("TAKE_PROFIT_PCT", 0.40)
     STOP_LOSS_PCT: float       = _float("STOP_LOSS_PCT", 0.20)

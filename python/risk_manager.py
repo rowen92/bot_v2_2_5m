@@ -94,6 +94,30 @@ class RiskManager:
             )
         return dynamic
 
+    def _in_sl_zone(self, state: State, current_price: float) -> bool:
+        """
+        Return True if current_price is within ANTI_REVENGE_ATR_MULT × ATR of
+        the last SL entry price — i.e. we are trying to re-enter the same zone
+        where the market just stopped us out.
+
+        Only active when consecutive_sl >= 1 (first retry after an SL).
+        Clears automatically once price moves far enough away.
+        """
+        if state.consecutive_sl < 1:
+            return False
+        if state.last_sl_entry_price <= 0 or state.last_sl_atr <= 0:
+            return False
+
+        zone_radius = state.last_sl_atr * 1.5   # 1.5 × ATR either side of SL entry
+        in_zone = abs(current_price - state.last_sl_entry_price) < zone_radius
+        if in_zone:
+            log.debug(
+                f"ANTI-REVENGE blocked  price={current_price:.6f}"
+                f"  last_sl_entry={state.last_sl_entry_price:.6f}"
+                f"  zone_radius={zone_radius:.6f}  atr={state.last_sl_atr:.6f}"
+            )
+        return in_zone
+
     def can_trade(self, state: State, live_balance: float | None = None) -> bool:
         """Return True if it is safe to open a new trade right now."""
 
@@ -115,6 +139,13 @@ class RiskManager:
                 f"side={pos.side}  entry={pos.entry_price:.4f}  "
                 f"trail_active={pos.trail_active}"
             )
+            return False
+
+        # Anti-revenge zone: block re-entry if price is still inside 1.5×ATR
+        # of the level where the last SL hit. Prevents chasing the same zone
+        # twice (e.g. trades 4+5 both entered at 0.0749 on the same dying move).
+        if self._in_sl_zone(state, state.mark_price):
+            log.debug("can_trade=False  reason=anti_revenge_zone")
             return False
 
         # Daily drawdown circuit breaker (Option B — replaces WR-based trade cap).
@@ -295,14 +326,16 @@ class RiskManager:
             activate_dist = pos.entry_price * (cfg.TRAIL_ACTIVATE_PCT / 100)
             callback_dist = pos.entry_price * (cfg.TRAIL_CALLBACK_PCT / 100)
 
-        # Breakeven distance = 0.5 × sl_dist — slides SL to entry once price
-        # has moved halfway to the full SL distance in our favour.
-        # Using the full sl_dist here would mean breakeven only triggers at the
-        # same tick the SL would fire, making it useless.
+        # Breakeven distance = BREAKEVEN_ATR_MULT × sl_dist.
+        # Default 0.5 (half SL dist) suits BTC/ETH/WLD where ATR is large.
+        # DOGE .env overrides to 1.0: on low-volatility coins (ATR ~7e-05) the
+        # 0.5× threshold equals ~1 ATR of pure tick noise and fires in seconds
+        # (trade #1: breakeven in 42s → immediately SL'd back to entry).
+        be_mult = cfg.BREAKEVEN_ATR_MULT
         if entry_atr and entry_atr > 0:
-            breakeven_dist = entry_atr * rp["sl"] * 0.5
+            breakeven_dist = entry_atr * rp["sl"] * be_mult
         else:
-            breakeven_dist = pos.entry_price * (cfg.STOP_LOSS_PCT / 100) * 0.5
+            breakeven_dist = pos.entry_price * (cfg.STOP_LOSS_PCT / 100) * be_mult
 
         if pos.side == "long":
             # Track the highest price seen

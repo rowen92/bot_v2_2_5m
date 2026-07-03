@@ -46,6 +46,17 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
         state.live_atr = indicators["atr"]
 
     if signal != "none":
+        # Block continuation entries on the very first trade after restart.
+        # On a fresh start we have no position history — we don't know how far
+        # the trend has already run or whether it is near exhaustion.
+        # Crossover entries are fine (fresh cross = fresh signal).
+        if not state.first_trade_done and strategy.was_continuation():
+            log.info(
+                f"STARTUP: continuation {signal.upper()} blocked — "
+                f"no trade history since restart; waiting for a fresh crossover"
+            )
+            return
+
         live_bal = None
         if not cfg.is_paper():
             live_bal = await orders._live_balance(client)

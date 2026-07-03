@@ -110,6 +110,18 @@ class State:
         # consecutive_sl: how many SL hits in a row without a winning trade between them
         self.consecutive_sl: int = 0
 
+        # Anti-revenge zone: price and ATR of the last SL hit.
+        # risk_manager uses these to block re-entries too close to the same
+        # price level where the market just stopped us out.
+        self.last_sl_entry_price: float = 0.0
+        self.last_sl_atr: float = 0.0
+
+        # Startup guard: False until the bot opens its first trade after (re)start.
+        # bot.py uses this to block continuation signals on the very first entry —
+        # on a fresh start we have no position history so we don't know how old
+        # the trend is or whether it's already exhausted.
+        self.first_trade_done: bool = False
+
         # Concurrency guard: prevents a second tick from triggering a second
         # close while an async _live_close / _paper_close is still in-flight.
         self.is_closing: bool = False

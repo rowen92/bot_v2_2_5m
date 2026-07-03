@@ -59,6 +59,14 @@ class ScalpingStrategy:
         self._last_df_hash: Optional[int] = None
         self._cached_df: Optional[pd.DataFrame] = None
         self._spike_lockout_remaining: int = 0  # candles left in post-spike lockout
+        self._last_signal_was_continuation: bool = False  # set by get_signal()
+
+    def was_continuation(self) -> bool:
+        """True if the last non-'none' signal was a continuation (no fresh cross).
+        Used by bot.py to block the very first post-restart trade when it is
+        a continuation — we have no prior position history to know the trend age.
+        """
+        return self._last_signal_was_continuation
 
     def indicator_snapshot(self, state: State) -> Optional[dict]:
         """
@@ -232,6 +240,7 @@ class ScalpingStrategy:
                 f"SIGNAL long  |  cross=bull  adx={row['adx']:.1f}  "
                 f"vol={row['volume']:.0f}  ema100={ema_trend:.4f}  close={close:.4f}"
             )
+            self._last_signal_was_continuation = False
             return "long"
 
         if cross == "bear" and adx_ok and vol_ok and spike_ok and in_downtrend and bias_short and ema_gap_ok_short and ema100_falling:
@@ -239,6 +248,7 @@ class ScalpingStrategy:
                 f"SIGNAL short |  cross=bear  adx={row['adx']:.1f}  "
                 f"vol={row['volume']:.0f}  ema100={ema_trend:.4f}  close={close:.4f}"
             )
+            self._last_signal_was_continuation = False
             return "short"
 
         # ── 2. Trend continuation entries (no fresh cross needed) ─────────────
@@ -250,6 +260,7 @@ class ScalpingStrategy:
                 f"SIGNAL long  |  continuation  adx={row['adx']:.1f}  "
                 f"vol={row['volume']:.0f}  ema100={ema_trend:.4f}  close={close:.4f}"
             )
+            self._last_signal_was_continuation = True
             return "long"
 
         if in_downtrend and adx_trend_ok and vol_ok and spike_ok and bias_short and ema_gap_ok_short and ema100_falling:
@@ -257,6 +268,7 @@ class ScalpingStrategy:
                 f"SIGNAL short |  continuation  adx={row['adx']:.1f}  "
                 f"vol={row['volume']:.0f}  ema100={ema_trend:.4f}  close={close:.4f}"
             )
+            self._last_signal_was_continuation = True
             return "short"
 
         return "none"

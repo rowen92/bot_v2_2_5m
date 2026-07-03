@@ -73,6 +73,7 @@ class OrderManager:
             pos.atr        = atr    # stored so update_trail() can use ATR-based distances
             pos.regime     = regime  # frozen at entry — governs trail for the life of this position
             state.position = pos
+            state.first_trade_done = True  # unlock continuation entries on next candle
             tlog.log_open(signal, entry, qty, tp, sl, cfg.TRADING_MODE, regime=regime)
 
         return pos
@@ -124,6 +125,12 @@ class OrderManager:
         state.last_close_reason = reason   # used by dynamic cooldown in risk_manager
         state.record_pnl(pnl)
         state.last_close_ts = time.time()   # start cooldown (wall-clock, survives restarts)
+
+        # Record SL zone for anti-revenge block in risk_manager.can_trade()
+        if reason == "sl":
+            state.last_sl_entry_price = pos.entry_price
+            state.last_sl_atr = pos.atr or 0.0
+
         state.position = None
         tlog.log_daily_stats(state)
         return pnl
