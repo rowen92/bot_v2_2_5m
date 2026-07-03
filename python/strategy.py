@@ -39,7 +39,7 @@ ADX_PERIOD    = 10     # shorter ADX window — reacts faster on 1m
 ADX_MIN       = 40.0   # minimum ADX for crossover entries (raised from 30 — filters marginal momentum)
 ADX_TREND_MIN = 50.0   # higher ADX required for trend-continuation entries (raised from 45)
 ADX_SLOPE_BARS = 2     # ADX must be rising over this many bars (tightened from 3 — catches momentum exhaustion faster)
-ADX_STRONG     = 45.0  # above this level, skip slope check — spike-induced ADX drops are noise, not exhaustion
+ADX_STRONG     = 50.0  # above this level, skip slope check — aligns with ADX_TREND_MIN; strong trends absorb 1-bar dips
 EMA_TREND_SLOPE_BARS = 5  # EMA100 must be moving in trade direction over this many bars
 VOL_MA        = 10     # volume average window
 VOL_MULT      = 0.6    # volume must be at least 60% of average
@@ -59,6 +59,8 @@ class ScalpingStrategy:
         self._cached_df: Optional[pd.DataFrame] = None
         self._spike_lockout_remaining: int = 0  # candles left in post-spike lockout
         self._last_signal_was_continuation: bool = False  # set by get_signal()
+        self._cross_window_remaining: int = 0   # candles left to treat last cross as active
+        self._cross_window_direction: str = "none"  # 'bull' | 'bear' | 'none'
 
     def was_continuation(self) -> bool:
         """True if the last non-'none' signal was a continuation (no fresh cross).
@@ -174,6 +176,31 @@ class ScalpingStrategy:
         vol_ok       = row["volume"]       >= row["vol_avg"] * VOL_MULT
         spike_ok     = row["candle_range"] <= row["atr"] * SPIKE_ATR_MULT
         cross        = row["cross"]
+
+        # ── Cross window: keep a fresh cross "active" for N candles ──────────
+        # A bull/bear cross fires on exactly one candle. If volume or ADX aren't
+        # ready that bar, the signal is permanently missed. The window counter
+        # lets the confirmation catch up on the next 1–3 bars.
+        # Reset the window if EMAs flip direction (cross is no longer valid).
+        _CROSS_WINDOW = 3  # candles after the cross candle to still treat as fresh
+        ema_fast_now = row["ema_fast"]
+        ema_slow_now = row["ema_slow"]
+        if cross in ("bull", "bear"):
+            self._cross_window_remaining = _CROSS_WINDOW
+            self._cross_window_direction = cross
+        elif self._cross_window_remaining > 0:
+            if (self._cross_window_direction == "bull" and ema_fast_now > ema_slow_now) or \
+               (self._cross_window_direction == "bear" and ema_fast_now < ema_slow_now):
+                cross = self._cross_window_direction  # extend cross signal
+                self._cross_window_remaining -= 1
+                log.debug(
+                    f"CROSS WINDOW extended  dir={cross}  "
+                    f"remaining={self._cross_window_remaining}"
+                )
+            else:
+                # EMAs flipped — cross is invalidated, kill the window
+                self._cross_window_remaining = 0
+                self._cross_window_direction = "none"
 
         ema_fast  = row["ema_fast"]
         ema_slow  = row["ema_slow"]
@@ -345,7 +372,7 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ema_trend"]    = _ema(df["close"], EMA_TREND)
     df["atr"]          = _atr(df, cfg.ATR_PERIOD)
     df["adx"]          = _adx(df, ADX_PERIOD)
-    df["vol_avg"]      = df["volume"].rolling(VOL_MA, min_periods=1).mean()
+    df["vol_avg"]      = df["volume"].rolling(VOL_MA, min_periods=1).median()
     df["candle_range"] = df["high"] - df["low"]
 
     prev_fast = df["ema_fast"].shift(1)
