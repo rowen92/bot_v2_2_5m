@@ -130,6 +130,7 @@ class OrderManager:
         if reason == "sl":
             state.last_sl_entry_price = pos.entry_price
             state.last_sl_atr = pos.atr or 0.0
+            state.last_sl_side = pos.side  # used by anti-revenge zone direction check
 
         state.position = None
         tlog.log_daily_stats(state)

@@ -115,6 +115,7 @@ class State:
         # price level where the market just stopped us out.
         self.last_sl_entry_price: float = 0.0
         self.last_sl_atr: float = 0.0
+        self.last_sl_side: str = ""   # 'long' | 'short' — side of the last SL trade
 
         # Startup guard: False until the bot opens its first trade after (re)start.
         # bot.py uses this to block continuation signals on the very first entry —

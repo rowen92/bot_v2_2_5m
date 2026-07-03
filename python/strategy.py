@@ -58,6 +58,7 @@ class ScalpingStrategy:
         self._last_df_hash: Optional[int] = None
         self._cached_df: Optional[pd.DataFrame] = None
         self._spike_lockout_remaining: int = 0  # candles left in post-spike lockout
+        self._spike_direction: str = "none"      # 'down' | 'up' — direction of the spike that triggered lockout
         self._last_signal_was_continuation: bool = False  # set by get_signal()
         self._cross_window_remaining: int = 0   # candles left to treat last cross as active
         self._cross_window_direction: str = "none"  # 'bull' | 'bear' | 'none'
@@ -177,12 +178,34 @@ class ScalpingStrategy:
         spike_ok     = row["candle_range"] <= row["atr"] * SPIKE_ATR_MULT
         cross        = row["cross"]
 
+        # ── Cumulative move guard: block entries at the top/bottom of a staircase pump/dump ──
+        # Per-candle spike filter is blind when each candle looks normal but the
+        # last N candles together represent an exhausted move (trade #6: 3
+        # consecutive bull candles, each sub-threshold, cumulative +2.5× ATR).
+        # Only applied to continuation signals — those are most vulnerable to chasing.
+        _CUMULATIVE_BARS     = 4
+        _CUMULATIVE_ATR_MULT = 2.0
+        if len(df) >= _CUMULATIVE_BARS + 1:
+            _ref_close     = df["close"].iloc[-1 - _CUMULATIVE_BARS]
+            _net_move      = row["close"] - _ref_close
+            _atr_limit     = row["atr"] * _CUMULATIVE_ATR_MULT
+            _pump_extended = _net_move >  _atr_limit
+            _dump_extended = _net_move < -_atr_limit
+        else:
+            _net_move = _atr_limit = 0.0
+            _pump_extended = _dump_extended = False
+
         # ── Cross window: keep a fresh cross "active" for N candles ──────────
         # A bull/bear cross fires on exactly one candle. If volume or ADX aren't
         # ready that bar, the signal is permanently missed. The window counter
         # lets the confirmation catch up on the next 1–3 bars.
         # Reset the window if EMAs flip direction (cross is no longer valid).
-        _CROSS_WINDOW = 3  # candles after the cross candle to still treat as fresh
+        # In CHOP (ADX 40-44) the cross window is collapsed to 1 — the market has
+        # marginal momentum and a 3-bar-old cross is too stale to act on safely.
+        # Trade #7: bear cross fired at 18:23, entry fired on 3rd extension at
+        # 18:26 with price already recovering — stale signal in a weak trend.
+        _adx_for_window = row["adx"]
+        _CROSS_WINDOW = 1 if _adx_for_window < 45 else 3
         ema_fast_now = row["ema_fast"]
         ema_slow_now = row["ema_slow"]
         if cross in ("bull", "bear"):
@@ -251,17 +274,45 @@ class ScalpingStrategy:
         # Massive volume spike lockout: if a candle had vol > 4× average,
         # block new entries for SPIKE_LOCKOUT_BARS candles — direction is
         # unreliable immediately after an extreme spike.
+        # Also record spike direction: a down-spike exhausts sellers, so the
+        # continuation short is already over by the time lockout clears.
         vol_avg = row["vol_avg"] if row["vol_avg"] > 0 else 1
         if row["volume"] > vol_avg * SPIKE_VOL_MULT:
             self._spike_lockout_remaining = SPIKE_LOCKOUT_BARS
+            prev_close = df["close"].iloc[-2] if len(df) >= 2 else close
+            self._spike_direction = "down" if close < prev_close else "up"
             log.debug(
                 f"SPIKE LOCKOUT set  vol={row['volume']:.0f}"
                 f"  avg={vol_avg:.0f}  lockout={SPIKE_LOCKOUT_BARS} bars"
+                f"  spike_dir={self._spike_direction}"
             )
+            # Block on the spike candle itself — the move is already extracted.
+            # Without this, the bull/bear cross or continuation on this same
+            # candle fires before the lockout takes effect (trade #9 pattern).
+            return "none"
         elif self._spike_lockout_remaining > 0:
             self._spike_lockout_remaining -= 1
             log.debug(f"SPIKE LOCKOUT active  remaining={self._spike_lockout_remaining}")
             return "none"
+        elif self._spike_direction != "none":
+            # First candle after lockout: block continuation in spike direction.
+            # The spike already extracted that move — entries in the same
+            # direction now are chasing an exhausted leg (trade #10 pattern).
+            if self._spike_direction == "down" and in_downtrend:
+                log.debug(
+                    f"POST-SPIKE DIR filtered  spike_dir=down  signal=short"
+                    f"  close={close:.4f}  ema21={ema_slow:.4f}"
+                )
+                self._spike_direction = "none"
+                return "none"
+            if self._spike_direction == "up" and in_uptrend:
+                log.debug(
+                    f"POST-SPIKE DIR filtered  spike_dir=up  signal=long"
+                    f"  close={close:.4f}  ema21={ema_slow:.4f}"
+                )
+                self._spike_direction = "none"
+                return "none"
+            self._spike_direction = "none"  # opposite direction — clear and proceed
 
         # ── 1. Crossover entries (fresh cross signal) ─────────────────────────
         if cross == "bull" and adx_ok and vol_ok and spike_ok and in_uptrend and bias_long and ema_gap_ok_long and ema100_rising:
@@ -285,20 +336,30 @@ class ScalpingStrategy:
         # Requires ADX >= 50 (vs 40 for crossover) to avoid choppy re-entries.
         # EMA100 bias still enforced — never trade against long-term trend.
         if in_uptrend and adx_trend_ok and vol_ok and spike_ok and bias_long and ema_gap_ok_long and ema100_rising:
-            log.info(
-                f"SIGNAL long  |  continuation  adx={row['adx']:.1f}  "
-                f"vol={row['volume']:.0f}  ema100={ema_trend:.4f}  close={close:.4f}"
-            )
-            self._last_signal_was_continuation = True
-            return "long"
+            if _pump_extended:
+                log.debug(
+                    f"CUMULATIVE MOVE filtered (long)  net={_net_move:.5f}  limit={_atr_limit:.5f}"
+                )
+            else:
+                log.info(
+                    f"SIGNAL long  |  continuation  adx={row['adx']:.1f}  "
+                    f"vol={row['volume']:.0f}  ema100={ema_trend:.4f}  close={close:.4f}"
+                )
+                self._last_signal_was_continuation = True
+                return "long"
 
         if in_downtrend and adx_trend_ok and vol_ok and spike_ok and bias_short and ema_gap_ok_short and ema100_falling:
-            log.info(
-                f"SIGNAL short |  continuation  adx={row['adx']:.1f}  "
-                f"vol={row['volume']:.0f}  ema100={ema_trend:.4f}  close={close:.4f}"
-            )
-            self._last_signal_was_continuation = True
-            return "short"
+            if _dump_extended:
+                log.debug(
+                    f"CUMULATIVE MOVE filtered (short)  net={_net_move:.5f}  limit={-_atr_limit:.5f}"
+                )
+            else:
+                log.info(
+                    f"SIGNAL short |  continuation  adx={row['adx']:.1f}  "
+                    f"vol={row['volume']:.0f}  ema100={ema_trend:.4f}  close={close:.4f}"
+                )
+                self._last_signal_was_continuation = True
+                return "short"
 
         return "none"
 

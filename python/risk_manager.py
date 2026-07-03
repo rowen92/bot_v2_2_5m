@@ -94,12 +94,14 @@ class RiskManager:
             )
         return dynamic
 
-    def _in_sl_zone(self, state: State, current_price: float) -> bool:
+    def _in_sl_zone(self, state: State, current_price: float, signal_side: str = "") -> bool:
         """
         Return True if current_price is within ANTI_REVENGE_ATR_MULT × ATR of
-        the last SL entry price — i.e. we are trying to re-enter the same zone
-        where the market just stopped us out.
+        the last SL entry price AND the new signal is in the OPPOSITE direction
+        to the last SL trade — i.e. a revenge trade (going long after a short SL).
 
+        Same-direction signals (continuing the trend that just stopped us out)
+        are NOT blocked — the cooldown and ADX/EMA filters already gate those.
         Only active when consecutive_sl >= 1 (first retry after an SL).
         Clears automatically once price moves far enough away.
         """
@@ -110,15 +112,25 @@ class RiskManager:
 
         zone_radius = state.last_sl_atr * 1.5   # 1.5 × ATR either side of SL entry
         in_zone = abs(current_price - state.last_sl_entry_price) < zone_radius
-        if in_zone:
+        if not in_zone:
+            return False
+
+        # Only block if the new signal is the OPPOSITE side to the last SL.
+        # Same-direction re-entry = trend continuation, not revenge.
+        last_side = getattr(state, "last_sl_side", "")  # 'long' | 'short' | ''
+        opposite = {"long": "short", "short": "long"}.get(last_side, "")
+        is_revenge = (signal_side == opposite) if (signal_side and opposite) else True  # default block if unknown
+
+        if is_revenge:
             log.debug(
                 f"ANTI-REVENGE blocked  price={current_price:.6f}"
                 f"  last_sl_entry={state.last_sl_entry_price:.6f}"
                 f"  zone_radius={zone_radius:.6f}  atr={state.last_sl_atr:.6f}"
+                f"  last_sl_side={last_side}  signal_side={signal_side}"
             )
-        return in_zone
+        return is_revenge
 
-    def can_trade(self, state: State, live_balance: float | None = None) -> bool:
+    def can_trade(self, state: State, live_balance: float | None = None, signal_side: str = "") -> bool:
         """Return True if it is safe to open a new trade right now."""
 
         # Dynamic cooldown — longer after SL hits and consecutive losses
@@ -144,7 +156,7 @@ class RiskManager:
         # Anti-revenge zone: block re-entry if price is still inside 1.5×ATR
         # of the level where the last SL hit. Prevents chasing the same zone
         # twice (e.g. trades 4+5 both entered at 0.0749 on the same dying move).
-        if self._in_sl_zone(state, state.mark_price):
+        if self._in_sl_zone(state, state.mark_price, signal_side=signal_side):
             log.debug("can_trade=False  reason=anti_revenge_zone")
             return False
 
