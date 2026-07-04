@@ -204,12 +204,16 @@ class ScalpingStrategy:
         # ready that bar, the signal is permanently missed. The window counter
         # lets the confirmation catch up on the next 1–3 bars.
         # Reset the window if EMAs flip direction (cross is no longer valid).
-        # In CHOP (ADX 40-44) the cross window is collapsed to 1 — the market has
-        # marginal momentum and a 3-bar-old cross is too stale to act on safely.
-        # Trade #7: bear cross fired at 18:23, entry fired on 3rd extension at
-        # 18:26 with price already recovering — stale signal in a weak trend.
+        # When ADX < 45 the window is 3 bars (raised from 1) to allow ADX time
+        # to confirm a slow, gradual breakout. On smooth trends (e.g. SUI) ADX
+        # lags the EMA cross by 3-4 bars — a 1-bar window permanently missed the
+        # entry (SUI 10:50 cross, ADX reached 40 only at 10:52).
+        # Other guards (adx_ok ≥ 40, ema_sep_ok, ema_gap_ok) still block stale
+        # crosses — the longer window only keeps the signal alive, not relaxed.
+        # Trade #7 risk (stale cross in weak trend): was adx < 30 at cross time,
+        # adx_ok (≥ 40) would have blocked it regardless of window length.
         _adx_for_window = row["adx"]
-        _CROSS_WINDOW = 1 if _adx_for_window < 45 else 3
+        _CROSS_WINDOW = 3
         ema_fast_now = row["ema_fast"]
         ema_slow_now = row["ema_slow"]
         if cross in ("bull", "bear"):
