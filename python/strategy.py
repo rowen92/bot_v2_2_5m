@@ -39,7 +39,10 @@ ADX_PERIOD    = 10     # shorter ADX window — reacts faster on 1m
 ADX_MIN       = 50.0   # minimum ADX for crossover entries (raised from 40 — blocks marginal TREND entries ADX 40-49)
 ADX_TREND_MIN = 55.0   # higher ADX required for trend-continuation entries (raised from 50 — filters ADX 50-54 weak continuations on WLFI)
 ADX_SLOPE_BARS = 2     # ADX must be rising over this many bars (tightened from 3 — catches momentum exhaustion faster)
-ADX_STRONG     = 70.0  # above this level, skip slope check — raised from 50: ADX 50-69 now requires rising slope (blocks exhausted entries like DOGE T5)
+ADX_STRONG     = 55.0  # above this level, skip ADX slope check — lowered from 70 now that the pullback
+                       # filter (price within 1.5×ATR of EMA21) is the primary guard against exhausted
+                       # entries. Requiring rising ADX during a healthy pullback to EMA21 was blocking
+                       # valid entries: ADX naturally dips during retracements even in strong trends.
 EMA_TREND_SLOPE_BARS = 3  # EMA50 must be moving in trade direction over this many bars
 VOL_MA        = 10     # volume average window
 VOL_MULT      = 0.6    # volume must be at least 60% of average
@@ -248,12 +251,19 @@ class ScalpingStrategy:
         bias_long  = close > ema_trend
         bias_short = close < ema_trend
 
-        # EMA21 distance guard: require price to be at least 0.5× ATR away from
-        # EMA_SLOW before entering. Entries right at EMA21 are equilibrium — the
-        # market has not yet committed to a direction and SL hits are frequent.
+        # Pullback entry guard: price must have pulled back CLOSE to EMA21 before
+        # entering — not extended far away from it. Entering when price is already
+        # 1.5+ ATR from EMA21 means chasing an exhausted leg (the move has already
+        # happened). The sweet spot is: trend confirmed (EMA8 > EMA21 > EMA50 aligned,
+        # ADX high) but price has retraced near EMA21, giving a low-risk entry with
+        # room to run.
+        # Minimum floor of 0.1×ATR kept: don't enter exactly at EMA21 (equilibrium).
+        # Maximum ceiling of 1.5×ATR: don't chase price that is already extended.
         atr_val = row["atr"]
-        ema_gap_ok_long  = (close - ema_slow) >  1.0 * atr_val
-        ema_gap_ok_short = (ema_slow - close) >  1.0 * atr_val
+        PULLBACK_MIN_ATR = 0.1   # price must be at least this far above/below EMA21 (on correct side)
+        PULLBACK_MAX_ATR = 1.5   # price must be no more than this far from EMA21
+        ema_gap_ok_long  = PULLBACK_MIN_ATR * atr_val < (close - ema_slow) <= PULLBACK_MAX_ATR * atr_val
+        ema_gap_ok_short = PULLBACK_MIN_ATR * atr_val < (ema_slow - close) <= PULLBACK_MAX_ATR * atr_val
 
         # EMA8-vs-EMA50 separation guard: EMA8 must be at least 0.5×ATR from
         # EMA50 before any entry. Near-zero separation means price is at
@@ -366,17 +376,21 @@ class ScalpingStrategy:
 
         # ── 1. Crossover entries (fresh cross signal) ─────────────────────────
         if cross == "bull" and adx_ok and vol_ok and spike_ok and in_uptrend and bias_long and ema_gap_ok_long and ema_sep_ok and ema50_rising:
+            _pb_dist = (close - ema_slow) / atr_val
             log.info(
                 f"SIGNAL long  |  cross=bull  adx={row['adx']:.1f}  "
-                f"vol={row['volume']:.0f}  ema50={ema_trend:.4f}  close={close:.4f}"
+                f"vol={row['volume']:.0f}  ema50={ema_trend:.4f}  close={close:.4f}  "
+                f"pullback={_pb_dist:.2f}x ATR from EMA21"
             )
             self._last_signal_was_continuation = False
             return "long"
 
         if cross == "bear" and adx_ok and vol_ok and spike_ok and in_downtrend and bias_short and ema_gap_ok_short and ema_sep_ok and ema50_falling:
+            _pb_dist = (ema_slow - close) / atr_val
             log.info(
                 f"SIGNAL short |  cross=bear  adx={row['adx']:.1f}  "
-                f"vol={row['volume']:.0f}  ema50={ema_trend:.4f}  close={close:.4f}"
+                f"vol={row['volume']:.0f}  ema50={ema_trend:.4f}  close={close:.4f}  "
+                f"pullback={_pb_dist:.2f}x ATR from EMA21"
             )
             self._last_signal_was_continuation = False
             return "short"
@@ -391,9 +405,11 @@ class ScalpingStrategy:
                     f"CUMULATIVE MOVE filtered (long)  net={_net_move:.5f}  limit={_atr_limit:.5f}"
                 )
             else:
+                _pb_dist = (close - ema_slow) / atr_val
                 log.info(
                     f"SIGNAL long  |  continuation  adx={row['adx']:.1f}  "
-                    f"vol={row['volume']:.0f}  ema50={ema_trend:.4f}  close={close:.4f}"
+                    f"vol={row['volume']:.0f}  ema50={ema_trend:.4f}  close={close:.4f}  "
+                    f"pullback={_pb_dist:.2f}x ATR from EMA21"
                 )
                 self._last_signal_was_continuation = True
                 return "long"
@@ -404,9 +420,11 @@ class ScalpingStrategy:
                     f"CUMULATIVE MOVE filtered (short)  net={_net_move:.5f}  limit={-_atr_limit:.5f}"
                 )
             else:
+                _pb_dist = (ema_slow - close) / atr_val
                 log.info(
                     f"SIGNAL short |  continuation  adx={row['adx']:.1f}  "
-                    f"vol={row['volume']:.0f}  ema50={ema_trend:.4f}  close={close:.4f}"
+                    f"vol={row['volume']:.0f}  ema50={ema_trend:.4f}  close={close:.4f}  "
+                    f"pullback={_pb_dist:.2f}x ATR from EMA21"
                 )
                 self._last_signal_was_continuation = True
                 return "short"
