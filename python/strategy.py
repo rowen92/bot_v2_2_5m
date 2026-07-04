@@ -39,7 +39,7 @@ ADX_PERIOD    = 10     # shorter ADX window — reacts faster on 1m
 ADX_MIN       = 50.0   # minimum ADX for crossover entries (raised from 40 — blocks marginal TREND entries ADX 40-49)
 ADX_TREND_MIN = 55.0   # higher ADX required for trend-continuation entries (raised from 50 — filters ADX 50-54 weak continuations on WLFI)
 ADX_SLOPE_BARS = 2     # ADX must be rising over this many bars (tightened from 3 — catches momentum exhaustion faster)
-ADX_STRONG     = 50.0  # above this level, skip slope check — aligns with ADX_TREND_MIN; strong trends absorb 1-bar dips
+ADX_STRONG     = 70.0  # above this level, skip slope check — raised from 50: ADX 50-69 now requires rising slope (blocks exhausted entries like DOGE T5)
 EMA_TREND_SLOPE_BARS = 3  # EMA50 must be moving in trade direction over this many bars
 VOL_MA        = 10     # volume average window
 VOL_MULT      = 0.6    # volume must be at least 60% of average
@@ -269,20 +269,23 @@ class ScalpingStrategy:
                 f"  threshold={0.5 * atr_val:.5f}"
             )
 
-        # EMA50 slope filter: require EMA50 to be moving in trade direction.
-        # A still-rising EMA50 means the long-term trend is bullish — a short
-        # entry against it is a counter-trend fade with high SL risk (e.g.
-        # trades 7+8 that fired after a STRONG_TREND long rally).
+        # EMA50 slope filter: require EMA50 to be moving in trade direction
+        # AND by a meaningful amount (at least 0.5×ATR over EMA_TREND_SLOPE_BARS).
+        # Direction alone is not enough — a flat EMA50 that ticks 1 pip counts
+        # as "falling" and would approve a SHORT into dead chop (e.g. DOGE T1:
+        # EMA50 moved only 0.000026 over 3 bars = 0.33×ATR while visually flat).
         # Falls back to True if not enough history — don't block on warmup.
+        ema50_slope_min = row["atr"] * 0.35  # minimum meaningful EMA50 movement (DOGE-specific: 0.35×ATR — blocks flat-EMA50 entries like T1/T3 while staying above noise)
         if len(df) > EMA_TREND_SLOPE_BARS:
             ema_trend_prev = df["ema_trend"].iloc[-1 - EMA_TREND_SLOPE_BARS]
-            ema50_rising  = ema_trend > ema_trend_prev
-            ema50_falling = ema_trend < ema_trend_prev
-            # flat (exact equality) → both are False → blocks all directions.
-            # Log only when EMA50 is flat (blocks both longs and shorts).
+            ema50_delta   = ema_trend - ema_trend_prev
+            ema50_rising  = ema50_delta >  ema50_slope_min
+            ema50_falling = ema50_delta < -ema50_slope_min
+            # flat (below threshold in either direction) → both are False → blocks all.
             if not ema50_rising and not ema50_falling:
                 log.debug(
-                    f"EMA50 SLOPE  rising={ema50_rising}  falling={ema50_falling}"
+                    f"EMA50 SLOPE flat  delta={ema50_delta:.6f}"
+                    f"  min={ema50_slope_min:.6f}"
                     f"  ema50={ema_trend:.5f}  prev={ema_trend_prev:.5f}"
                 )
         else:

@@ -355,13 +355,15 @@ class RiskManager:
                 pos.best_price = mark_price
 
             if not pos.trail_active:
-                # Breakeven stop: slide SL to entry once price moves 1×SL dist in profit
+                # Breakeven stop: slide SL to entry + lock-in buffer once price moves in profit
                 if pos.best_price >= pos.entry_price + breakeven_dist:
-                    if pos.sl_price < pos.entry_price:
-                        pos.sl_price = pos.entry_price
+                    lock_price = pos.entry_price + breakeven_dist * cfg.BREAKEVEN_LOCK_MULT
+                    if pos.sl_price < lock_price:
+                        pos.sl_price = lock_price
                         log.debug(
                             f"Breakeven SL  LONG  entry={pos.entry_price:.4f}"
                             f"  best={pos.best_price:.4f}  new_sl={pos.sl_price:.4f}"
+                            f"  lock={cfg.BREAKEVEN_LOCK_MULT}x"
                         )
                 # Activate trail once price moves far enough above entry
                 if pos.best_price >= pos.entry_price + activate_dist:
@@ -386,13 +388,15 @@ class RiskManager:
                 pos.best_price = mark_price
 
             if not pos.trail_active:
-                # Breakeven stop: slide SL to entry once price moves 1×SL dist in profit
+                # Breakeven stop: slide SL to entry - lock-in buffer once price moves in profit
                 if pos.best_price <= pos.entry_price - breakeven_dist:
-                    if pos.sl_price > pos.entry_price:
-                        pos.sl_price = pos.entry_price
+                    lock_price = pos.entry_price - breakeven_dist * cfg.BREAKEVEN_LOCK_MULT
+                    if pos.sl_price > lock_price:
+                        pos.sl_price = lock_price
                         log.debug(
                             f"Breakeven SL  SHORT  entry={pos.entry_price:.4f}"
                             f"  best={pos.best_price:.4f}  new_sl={pos.sl_price:.4f}"
+                            f"  lock={cfg.BREAKEVEN_LOCK_MULT}x"
                         )
                 # Activate trail once price moves far enough below entry
                 if pos.best_price <= pos.entry_price - activate_dist:

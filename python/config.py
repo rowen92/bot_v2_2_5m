@@ -108,6 +108,12 @@ class Config:
     # equals ~1 ATR of pure tick noise and fires within seconds (trade #1: 42s).
     BREAKEVEN_ATR_MULT: float = _float('BREAKEVEN_ATR_MULT', 0.5)
 
+    # ── Positive breakeven lock-in ─────────────────────────────────────────────
+    # When breakeven triggers, SL moves to entry + (sl_dist × BREAKEVEN_LOCK_MULT)
+    # instead of exactly entry. Locks in a small profit to cover fees.
+    # 0.0 = classic breakeven (current behaviour). 0.2 = lock in 20% of SL dist.
+    BREAKEVEN_LOCK_MULT: float = _float('BREAKEVEN_LOCK_MULT', 0.2)
+
     # ── Fixed-% fallback (used only when ATR is unavailable) ──────────────────
     TAKE_PROFIT_PCT: float     = _float("TAKE_PROFIT_PCT", 0.40)
     STOP_LOSS_PCT: float       = _float("STOP_LOSS_PCT", 0.20)
