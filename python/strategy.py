@@ -36,7 +36,7 @@ EMA_FAST      = 8      # fast EMA — momentum detection
 EMA_SLOW      = 21     # slow EMA — medium-term trend reference (Fib 21)
 EMA_TREND     = 50     # long-term bias — only long above, only short below
 ADX_PERIOD    = 10     # shorter ADX window — reacts faster on 1m
-ADX_MIN       = 40.0   # minimum ADX for crossover entries (raised from 30 — filters marginal momentum)
+ADX_MIN       = 50.0   # minimum ADX for crossover entries (raised from 40 — blocks marginal TREND entries ADX 40-49)
 ADX_TREND_MIN = 55.0   # higher ADX required for trend-continuation entries (raised from 50 — filters ADX 50-54 weak continuations on WLFI)
 ADX_SLOPE_BARS = 2     # ADX must be rising over this many bars (tightened from 3 — catches momentum exhaustion faster)
 ADX_STRONG     = 50.0  # above this level, skip slope check — aligns with ADX_TREND_MIN; strong trends absorb 1-bar dips
@@ -139,11 +139,13 @@ class ScalpingStrategy:
 
         if adx >= 50 and ema_separation >= 1.5 * atr:
             regime = "STRONG_TREND"
-        elif adx >= 45 and ema_aligned:
+        elif adx >= 50 and ema_aligned:
             regime = "TREND"
         else:
-            # ADX 40-44: valid crossover signal but marginal momentum → tighter params
-            # ADX < 40: no signal fires anyway, but safe default while warming up
+            # ADX < 50: crossover entries at ADX 40-49 get CHOP risk params
+            # (tighter SL/TP). ADX_TREND_MIN=55 still guards continuations.
+            # ADX 45-49 was TREND before — raised to 50 to stop marginal-momentum
+            # FLIP entries from opening with TREND-wide stops (WLD T2/T4 losses).
             regime = "CHOP"
 
         log.debug(
