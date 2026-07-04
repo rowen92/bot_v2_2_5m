@@ -84,16 +84,20 @@ class Config:
     CHOP_TP_MULT:   float = _float('CHOP_TP_MULT',   3.0)
     CHOP_TRAIL_ACT: float = _float('CHOP_TRAIL_ACT', 4.0)   # > tp → trail never fires
     CHOP_TRAIL_CB:  float = _float('CHOP_TRAIL_CB',  0.50)
+    # Block all new entries when market_regime == CHOP (ADX < 45, weak momentum).
+    # Trade #11: CHOP entry into a 7hr range → instant SL. No edge in this regime.
+    # Set CHOP_BLOCK=false in .env to re-enable per-bot if needed.
+    CHOP_BLOCK:     bool  = os.getenv('CHOP_BLOCK', 'true').lower() == 'true'
 
     TREND_SL_MULT:   float = _float('TREND_SL_MULT',   2.0)
     TREND_TP_MULT:   float = _float('TREND_TP_MULT',   4.0)
-    TREND_TRAIL_ACT: float = _float('TREND_TRAIL_ACT', 3.5)
-    TREND_TRAIL_CB:  float = _float('TREND_TRAIL_CB',  0.75)
+    TREND_TRAIL_ACT: float = _float('TREND_TRAIL_ACT', 2.0)   # lowered from 3.5 — WLD trends are short; arm trail at breakeven distance so it fires before reversal
+    TREND_TRAIL_CB:  float = _float('TREND_TRAIL_CB',  0.75)   # widened from 0.60 — tolerate normal pullbacks within the trend instead of exiting on first dip
 
     STRONG_TREND_SL_MULT:   float = _float('STRONG_TREND_SL_MULT',   2.5)
     STRONG_TREND_TP_MULT:   float = _float('STRONG_TREND_TP_MULT',   5.0)
-    STRONG_TREND_TRAIL_ACT: float = _float('STRONG_TREND_TRAIL_ACT', 3.0)
-    STRONG_TREND_TRAIL_CB:  float = _float('STRONG_TREND_TRAIL_CB',  0.60)
+    STRONG_TREND_TRAIL_ACT: float = _float('STRONG_TREND_TRAIL_ACT', 2.5)  # lowered from 3.0 — genuine breakouts also reverse fast on WLD
+    STRONG_TREND_TRAIL_CB:  float = _float('STRONG_TREND_TRAIL_CB',  0.75)  # widened from 0.60 — ride the move without early shake-out
 
     # ── Breakeven SL threshold multiplier ─────────────────────────────────────
     # Breakeven SL slides pos.sl_price to entry once:

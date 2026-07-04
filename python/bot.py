@@ -55,15 +55,15 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
             # Allow strong-trend continuations at startup (ADX >= 60 = clearly
             # not near exhaustion). Only block weak/borderline continuations
             # where we genuinely don't know if the trend is aging.
-            if adx_now < 60.0:
+            if adx_now < 55.0:
                 log.info(
                     f"STARTUP: continuation {signal.upper()} blocked — "
-                    f"adx={adx_now:.1f} < 60; waiting for a fresh crossover or stronger trend"
+                    f"adx={adx_now:.1f} < 55; waiting for a fresh crossover or stronger trend"
                 )
                 return
             log.info(
                 f"STARTUP: continuation {signal.upper()} ALLOWED — "
-                f"adx={adx_now:.1f} >= 60 (strong trend, low exhaustion risk)"
+                f"adx={adx_now:.1f} >= 55 (strong trend, low exhaustion risk)"
             )
 
         live_bal = None
@@ -94,6 +94,17 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
                     f"FLIP detected — closing {pos.side.upper()} to open {signal.upper()}"
                 )
                 await orders.close_position("FLIP", state, client)
+
+        # CHOP block: skip new entries (not flips) when market regime is CHOP.
+        # ADX < 45 = no real momentum — entries in this regime have no edge on WLD.
+        # Flips are exempt: closing + reversing on a hard opposite signal is still valid.
+        if cfg.CHOP_BLOCK and not is_flip:
+            regime_now = strategy.market_regime(state)
+            if regime_now == "CHOP":
+                log.info(
+                    f"CHOP_BLOCK: {signal.upper()} skipped — regime=CHOP (ADX < 45, no edge)"
+                )
+                return
 
         if is_flip or risk.can_trade(state, live_balance=live_bal, signal_side=signal):
             atr = indicators.get("atr")   # float from strategy snapshot, or None
