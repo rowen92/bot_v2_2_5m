@@ -444,22 +444,30 @@ class ScalpingStrategy:
             self._short_armed = False  # consumed
             return "short"
 
-        # ── 1b. Exhaustion-armed cross entries ────────────────────────────────
+        # ── 1b. Exhaustion-armed entries (no cross required) ──────────────────
         # Fires when a prior exhaustion detection (ADX peak while still in trend)
-        # armed the flag, and the subsequent EMA cross confirms the reversal.
-        # No adx_ok / ema50 slope / spike_ok / ema_sep_ok required:
-        #   - ADX is naturally low post-exhaustion (peaked and falling by definition)
-        #   - EMA50 slope lags the actual reversal
-        #   - EMA sep is small at the cross (EMA8 just flipped through EMA21)
-        #   - Reversal candle is often slightly larger than normal (exhaustion momentum)
-        #     — filtering at 1.5× ATR would block legitimate entries or force a
-        #       1-candle delay via cross window at a worse price
-        if cross == "bear" and self._short_armed and vol_ok and in_downtrend:
-            _pb_dist = (ema_slow - close) / atr_val
+        # armed the flag. Cross requirement removed: by the time EMA8 crosses EMA21
+        # the best entry price is already gone, and ema_sep_ok is naturally tiny
+        # at cross time (EMA8 just flipped through EMA21), making the cross guard
+        # self-defeating.
+        #
+        # Guards used instead of cross:
+        #   - ema_sep_ok: EMA8 must be >= 0.5×ATR from EMA50 — ensures price is
+        #     not at equilibrium and has real room to mean-revert toward EMA21/EMA50
+        #   - close < ema_slow (LONG) / close > ema_slow (SHORT): price must be
+        #     stretched away from EMA21, confirming reversion room exists
+        #   - in_downtrend / in_uptrend: EMA8/21 alignment still required
+        #   - vol_ok: volume confirmation still required
+        #
+        # ADX slope, EMA50 slope, spike filter still skipped — same reasoning as before:
+        #   ADX is naturally falling post-exhaustion; EMA50 slope lags; exhaustion
+        #   candles are often larger than normal.
+        if self._short_armed and vol_ok and in_uptrend and ema_sep_ok and close > ema_slow:
+            _pb_dist = (close - ema_slow) / atr_val
             log.info(
-                f"SIGNAL short |  exhaustion cross=bear  armed_remaining={self._short_armed_remaining}"
+                f"SIGNAL short |  exhaustion armed  armed_remaining={self._short_armed_remaining}"
                 f"  adx={row['adx']:.1f}  ema50={ema_trend:.4f}  close={close:.4f}"
-                f"  pullback={_pb_dist:.2f}x ATR from EMA21"
+                f"  stretch={_pb_dist:.2f}x ATR from EMA21"
             )
             self._short_armed = False
             self._short_armed_remaining = 0
@@ -468,12 +476,12 @@ class ScalpingStrategy:
             self._last_signal_was_di_snap = False
             return "short"
 
-        if cross == "bull" and self._long_armed and vol_ok and in_uptrend:
-            _pb_dist = (close - ema_slow) / atr_val
+        if self._long_armed and vol_ok and in_downtrend and ema_sep_ok and close < ema_slow:
+            _pb_dist = (ema_slow - close) / atr_val
             log.info(
-                f"SIGNAL long  |  exhaustion cross=bull  armed_remaining={self._long_armed_remaining}"
+                f"SIGNAL long  |  exhaustion armed  armed_remaining={self._long_armed_remaining}"
                 f"  adx={row['adx']:.1f}  ema50={ema_trend:.4f}  close={close:.4f}"
-                f"  pullback={_pb_dist:.2f}x ATR from EMA21"
+                f"  stretch={_pb_dist:.2f}x ATR from EMA21"
             )
             self._long_armed = False
             self._long_armed_remaining = 0

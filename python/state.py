@@ -60,6 +60,20 @@ class Position:
     is_di_snap:      bool  = False  # True if this position was opened by DI-snap logic
     di_snap_tp:      float = 0.0    # fixed TP = EMA21 at entry time
 
+    # Exhaustion-armed entries (1b) trail using EMA21 of the previous closed candle
+    # instead of the ATR 1R:2R system. EMA21 is a natural floor/ceiling for
+    # mean-reversion trades: once price crosses back through EMA21 the trade is done.
+    #
+    # Two-phase exit:
+    #   Phase 1 (ema21_trail_active=False): price hasn't reached EMA21 yet.
+    #           Only the hard SL protects. Trail is dormant.
+    #   Phase 2 (ema21_trail_active=True):  price has crossed EMA21.
+    #           ema21_trail_stop ratchets with EMA21 each candle.
+    #           Exit when price crosses back through ema21_trail_stop.
+    is_exhaustion_armed:  bool  = False  # True if opened by section 1b armed logic
+    ema21_trail_active:   bool  = False  # True once price has crossed EMA21 (trail armed)
+    ema21_trail_stop:     float = 0.0    # current EMA21-based trail level (updated each candle)
+
 
 # ── Main state object ──────────────────────────────────────────────────────────
 

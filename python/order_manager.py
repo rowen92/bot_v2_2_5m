@@ -80,12 +80,16 @@ class OrderManager:
         else:
             pos = await self._live_open(signal, entry, qty, tp, sl, client)
 
+        is_exhaustion_armed = strategy is not None and strategy.was_exhaustion_reversal() and not is_di_snap
+
         if pos:
-            pos.best_price  = entry    # initialise trailing high-water-mark
-            pos.atr         = atr      # stored so update_trail() can use ATR-based distances
-            pos.regime      = regime   # frozen at entry — governs trail for the life of this position
-            pos.is_di_snap  = is_di_snap
-            pos.di_snap_tp  = tp if is_di_snap else 0.0
+            pos.best_price          = entry    # initialise trailing high-water-mark
+            pos.atr                 = atr      # stored so update_trail() can use ATR-based distances
+            pos.regime              = regime   # frozen at entry — governs trail for the life of this position
+            pos.is_di_snap          = is_di_snap
+            pos.di_snap_tp          = tp if is_di_snap else 0.0
+            pos.is_exhaustion_armed = is_exhaustion_armed
+            pos.ema21_trail_stop    = 0.0      # initialised to 0; set on first candle close
             state.position = pos
             state.first_trade_done = True  # unlock continuation entries on next candle
             tlog.log_open(signal, entry, qty, tp, sl, cfg.TRADING_MODE, regime=regime)
@@ -158,8 +162,15 @@ class OrderManager:
         self,
         state: State,
         client: Optional[AsyncClient] = None,
+        ema21: float | None = None,
     ) -> None:
-        """Check if TP or SL has been touched; close if so."""
+        """Check if TP or SL has been touched; close if so.
+
+        `ema21` — EMA21 value from the just-closed candle.  When provided and
+        the position is an exhaustion-armed (1b) entry, the EMA21 trail is
+        updated and checked.  None on tick calls (no new candle) — EMA21 trail
+        only ratchets on candle close, not on every price tick.
+        """
         pos = state.position
         if pos is None:
             return
@@ -187,13 +198,29 @@ class OrderManager:
                     hit = "tp"
                 elif price >= pos.sl_price:
                     hit = "sl"
+
+        elif pos.is_exhaustion_armed:
+            # ── Exhaustion-armed (1b): EMA21-based trail + hard SL ───────────
+            # EMA21 trail only updates on candle close (when ema21 is passed).
+            # Between candle closes, only the hard SL is checked tick-by-tick.
+            if ema21 is not None:
+                if rm.update_ema21_trail(pos, price, ema21):
+                    hit = "trail_tp"
+            # Hard SL always active
+            if hit is None:
+                if pos.side == "long":
+                    if price <= pos.sl_price:
+                        hit = "sl"
+                else:
+                    if price >= pos.sl_price:
+                        hit = "sl"
+
         else:
-            # ── Trailing TP (takes priority over fixed TP once active) ────────
+            # ── ATR 1R:2R trailing (crossover + continuation entries) ─────────
             if rm.update_trail(pos, price, live_atr=state.live_atr):
                 hit = "trail_tp"
 
             # ── Hard SL (fires immediately — real loss protection) ────────────
-            # No fixed TP: exits are trail stop only (arms at +2R, 1R callback).
             if hit is None:
                 if pos.side == "long":
                     if price <= pos.sl_price:
