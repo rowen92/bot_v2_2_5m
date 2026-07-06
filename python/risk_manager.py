@@ -193,29 +193,14 @@ class RiskManager:
     # ── Regime-based multipliers ──────────────────────────────────────────────
 
     def regime_params(self, regime: str) -> dict:
-        """Return SL/TP/trail multipliers for the given market regime.
-        All values are read from cfg so they can be tuned per-bot via .env
-        without touching code.
+        """Return SL multiplier for the given market regime.
+        Trail activation (+2R) and callback (1R) are derived from sl_mult
+        in update_trail() — no separate trail_act/trail_cb needed.
         """
         params = {
-            "STRONG_TREND": {
-                "sl":        cfg.STRONG_TREND_SL_MULT,
-                "tp":        cfg.STRONG_TREND_TP_MULT,
-                "trail_act": cfg.STRONG_TREND_TRAIL_ACT,
-                "trail_cb":  cfg.STRONG_TREND_TRAIL_CB,
-            },
-            "TREND": {
-                "sl":        cfg.TREND_SL_MULT,
-                "tp":        cfg.TREND_TP_MULT,
-                "trail_act": cfg.TREND_TRAIL_ACT,
-                "trail_cb":  cfg.TREND_TRAIL_CB,
-            },
-            "CHOP": {
-                "sl":        cfg.CHOP_SL_MULT,
-                "tp":        cfg.CHOP_TP_MULT,
-                "trail_act": cfg.CHOP_TRAIL_ACT,
-                "trail_cb":  cfg.CHOP_TRAIL_CB,
-            },
+            "STRONG_TREND": {"sl": cfg.STRONG_TREND_SL_MULT},
+            "TREND":        {"sl": cfg.TREND_SL_MULT},
+            "CHOP":         {"sl": cfg.CHOP_SL_MULT},
         }
         return params.get(regime, params["TREND"])
 
@@ -266,20 +251,7 @@ class RiskManager:
             return 0.0
         return qty
 
-    # ── TP / SL price levels ──────────────────────────────────────────────────
-
-    def tp_price(self, entry: float, side: str, atr: float | None = None, regime: str = "TREND") -> float:
-        """
-        Take-profit price.  Uses ATR-based distance (tp_mult × ATR) when
-        available, where tp_mult is chosen by market regime.
-        Falls back to fixed TAKE_PROFIT_PCT otherwise.
-        """
-        if atr and atr > 0:
-            tp_mult = self.regime_params(regime)["tp"]
-            dist    = atr * tp_mult
-        else:
-            dist = entry * (cfg.TAKE_PROFIT_PCT / 100)
-        return entry + dist if side == "long" else entry - dist
+    # ── SL price level ────────────────────────────────────────────────────────
 
     def sl_price(self, entry: float, side: str, atr: float | None = None, regime: str = "TREND") -> float:
         """
@@ -312,102 +284,83 @@ class RiskManager:
 
     def update_trail(self, pos, mark_price: float, live_atr: float | None = None) -> bool:
         """
-        Update trailing TP state on `pos` (a Position dataclass).
-        Returns True when the trail stop has been hit and we should close.
+        Unified 1R:2R trailing system — all regimes, no fixed TP.
 
-        activate_dist uses pos.atr (frozen at entry) + regime trail_act mult —
-        keeps the activation threshold stable regardless of what the market does after entry.
-        callback_dist uses live_atr × sl_mult × trail_cb — adapts to current
-        volatility: a volatile market (high live_atr) gets a wider callback so
-        normal price swings don't shake the position out; a quiet market (low
-        live_atr) gets a tighter callback to lock gains quickly.
-        Falls back to pos.atr if live_atr not available.
+        Rules:
+          - sl_dist  = ATR × sl_mult (frozen at entry, same as SL placement)
+          - Trail activates when best_price moves +2× sl_dist from entry
+          - Trail callback = 1× sl_dist (floor ratchets up 1R for every 1R gained)
+          - No breakeven SL — trail activation at +2R already guarantees +1R floor
+          - No fixed TP — only exits are trail stop or hard SL
 
-        pos.regime is frozen at entry — the regime that decided to open the trade
-        also governs how it trails, regardless of regime changes while in the position.
+        Example (1R = $1 risk):
+          best=+2R → trail floor = +1R
+          best=+3R → trail floor = +2R
+          best=+5R → trail floor = +4R
         """
-        entry_atr    = getattr(pos, "atr", None)
-        callback_atr = live_atr if (live_atr and live_atr > 0) else entry_atr
-        regime       = getattr(pos, "regime", "TREND")
-        rp           = self.regime_params(regime)
+        entry_atr = getattr(pos, "atr", None)
+        regime    = getattr(pos, "regime", "TREND")
+        rp        = self.regime_params(regime)
 
         if entry_atr and entry_atr > 0:
-            activate_dist = entry_atr   * rp["trail_act"]                # regime-based activation
-            callback_dist = callback_atr * rp["sl"] * rp["trail_cb"]     # regime sl_mult × trail_cb
+            sl_dist       = entry_atr * rp["sl"]   # 1R in price terms (frozen at entry)
+            activate_dist = sl_dist * 2.0           # trail arms at +2R
+            callback_dist = sl_dist * 1.0           # trail floor moves up 1R at a time
         else:
-            activate_dist = pos.entry_price * (cfg.TRAIL_ACTIVATE_PCT / 100)
-            callback_dist = pos.entry_price * (cfg.TRAIL_CALLBACK_PCT / 100)
-
-        # Breakeven distance = BREAKEVEN_ATR_MULT × sl_dist.
-        # Default 0.5 (half SL dist) suits BTC/ETH/WLD where ATR is large.
-        # DOGE .env overrides to 1.0: on low-volatility coins (ATR ~7e-05) the
-        # 0.5× threshold equals ~1 ATR of pure tick noise and fires in seconds
-        # (trade #1: breakeven in 42s → immediately SL'd back to entry).
-        be_mult = cfg.BREAKEVEN_ATR_MULT
-        if entry_atr and entry_atr > 0:
-            breakeven_dist = entry_atr * rp["sl"] * be_mult
-        else:
-            breakeven_dist = pos.entry_price * (cfg.STOP_LOSS_PCT / 100) * be_mult
+            # Fallback: fixed-% when ATR unavailable (warm-up edge case)
+            sl_dist       = pos.entry_price * (cfg.STOP_LOSS_PCT / 100)
+            activate_dist = sl_dist * 2.0
+            callback_dist = sl_dist * 1.0
 
         if pos.side == "long":
-            # Track the highest price seen
             if mark_price > pos.best_price:
                 pos.best_price = mark_price
 
             if not pos.trail_active:
-                # Breakeven stop: slide SL to entry + lock-in buffer once price moves in profit
-                if pos.best_price >= pos.entry_price + breakeven_dist:
-                    lock_price = pos.entry_price + breakeven_dist * cfg.BREAKEVEN_LOCK_MULT
-                    if pos.sl_price < lock_price:
-                        pos.sl_price = lock_price
-                        log.debug(
-                            f"Breakeven SL  LONG  entry={pos.entry_price:.4f}"
-                            f"  best={pos.best_price:.4f}  new_sl={pos.sl_price:.4f}"
-                            f"  lock={cfg.BREAKEVEN_LOCK_MULT}x"
-                        )
-                # Activate trail once price moves far enough above entry
+                # Arm trail at +2R
                 if pos.best_price >= pos.entry_price + activate_dist:
                     pos.trail_active = True
-                    pos.trail_stop = pos.best_price - callback_dist
+                    pos.trail_stop   = pos.best_price - callback_dist
                     log.info(
                         f"Trail activated LONG  best={pos.best_price:.4f}"
                         f"  trail_stop={pos.trail_stop:.4f}"
+                        f"  floor=+{(pos.trail_stop - pos.entry_price) / sl_dist:.1f}R"
                     )
             else:
-                # Ratchet up the trail stop
+                # Ratchet floor up 1R at a time
                 new_stop = pos.best_price - callback_dist
                 if new_stop > pos.trail_stop:
                     pos.trail_stop = new_stop
-                # Check hit
+                    log.debug(
+                        f"Trail ratchet LONG  best={pos.best_price:.4f}"
+                        f"  trail_stop={pos.trail_stop:.4f}"
+                        f"  floor=+{(pos.trail_stop - pos.entry_price) / sl_dist:.1f}R"
+                    )
                 if mark_price <= pos.trail_stop:
-                    return True  # close signal
+                    return True
 
         else:  # short
-            # Track the lowest price seen
             if pos.best_price == 0.0 or mark_price < pos.best_price:
                 pos.best_price = mark_price
 
             if not pos.trail_active:
-                # Breakeven stop: slide SL to entry - lock-in buffer once price moves in profit
-                if pos.best_price <= pos.entry_price - breakeven_dist:
-                    lock_price = pos.entry_price - breakeven_dist * cfg.BREAKEVEN_LOCK_MULT
-                    if pos.sl_price > lock_price:
-                        pos.sl_price = lock_price
-                        log.debug(
-                            f"Breakeven SL  SHORT  entry={pos.entry_price:.4f}"
-                            f"  best={pos.best_price:.4f}  new_sl={pos.sl_price:.4f}"
-                            f"  lock={cfg.BREAKEVEN_LOCK_MULT}x"
-                        )
-                # Activate trail once price moves far enough below entry
                 if pos.best_price <= pos.entry_price - activate_dist:
                     pos.trail_active = True
-                    pos.trail_stop = pos.best_price + callback_dist
+                    pos.trail_stop   = pos.best_price + callback_dist
                     log.info(
                         f"Trail activated SHORT  best={pos.best_price:.4f}"
                         f"  trail_stop={pos.trail_stop:.4f}"
+                        f"  floor=+{(pos.entry_price - pos.trail_stop) / sl_dist:.1f}R"
                     )
             else:
                 new_stop = pos.best_price + callback_dist
+                if new_stop < pos.trail_stop:
+                    pos.trail_stop = new_stop
+                    log.debug(
+                        f"Trail ratchet SHORT  best={pos.best_price:.4f}"
+                        f"  trail_stop={pos.trail_stop:.4f}"
+                        f"  floor=+{(pos.entry_price - pos.trail_stop) / sl_dist:.1f}R"
+                    )
                 if new_stop < pos.trail_stop:
                     pos.trail_stop = new_stop
                 if mark_price >= pos.trail_stop:

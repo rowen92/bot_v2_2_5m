@@ -81,8 +81,11 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
             # Opposite signal while in a position — close current and flip.
             # Only fires if signal passed all filters (ADX, volume, spike, trend).
             # Guard: skip the FLIP if ADX is below 40 or declining (choppy reversal risk).
+            # Exception: exhaustion reversals fire precisely when ADX is falling —
+            # the ADX floor would always suppress them, so bypass it for that case.
             adx_now   = indicators.get("adx", 0)
-            adx_ok_flip = adx_now >= 40
+            is_exhaustion_flip = strategy.was_exhaustion_reversal()
+            adx_ok_flip = is_exhaustion_flip or (adx_now >= 40)
             if not adx_ok_flip:
                 log.debug(
                     f"FLIP suppressed  adx={adx_now:.1f} < 40  "
@@ -92,13 +95,17 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
             else:
                 log.info(
                     f"FLIP detected — closing {pos.side.upper()} to open {signal.upper()}"
+                    f"{'  [exhaustion reversal]' if is_exhaustion_flip else ''}"
                 )
                 await orders.close_position("FLIP", state, client)
 
         # CHOP block: skip new entries (not flips) when market regime is CHOP.
         # ADX < 45 = no real momentum — entries in this regime have no edge on WLD.
         # Flips are exempt: closing + reversing on a hard opposite signal is still valid.
-        if cfg.CHOP_BLOCK and not is_flip:
+        # Exhaustion reversals are exempt: they fire precisely when ADX is falling
+        # (CHOP regime by definition) — blocking them defeats their purpose.
+        is_exhaustion = strategy.was_exhaustion_reversal()
+        if cfg.CHOP_BLOCK and not is_flip and not is_exhaustion:
             regime_now = strategy.market_regime(state)
             if regime_now == "CHOP":
                 log.info(

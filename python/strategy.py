@@ -35,18 +35,20 @@ log = logging.getLogger("strategy")
 EMA_FAST      = 8      # fast EMA — momentum detection
 EMA_SLOW      = 21     # slow EMA — medium-term trend reference (Fib 21)
 EMA_TREND     = 50     # long-term bias — only long above, only short below
-ADX_PERIOD    = 10     # shorter ADX window — reacts faster on 1m
-ADX_MIN       = 50.0   # minimum ADX for crossover entries (raised from 40 — blocks marginal TREND entries ADX 40-49)
-ADX_TREND_MIN = 55.0   # higher ADX required for trend-continuation entries (raised from 50 — filters ADX 50-54 weak continuations on WLFI)
-ADX_SLOPE_BARS = 2     # ADX must be rising over this many bars (tightened from 3 — catches momentum exhaustion faster)
-ADX_STRONG     = 55.0  # above this level, skip ADX slope check — lowered from 70 now that the pullback
+ADX_PERIOD    = 14     # standard ADX window for 5m — balances reactivity and smoothness
+ADX_MIN       = 40.0   # minimum ADX for crossover entries (5m trends are slower; 40 is the reliable floor)
+ADX_TREND_MIN = 50.0   # higher ADX required for trend-continuation entries (50 = confirmed momentum on 5m)
+ADX_SLOPE_BARS = 3     # ADX must be rising over this many bars (5m is smoother; 3 bars = 15 min confirmation)
+ADX_STRONG     = 60.0  # above this level, skip ADX slope check — 5m trends that reach 60 are clearly strong; the pullback
                        # filter (price within 1.5×ATR of EMA21) is the primary guard against exhausted
                        # entries. Requiring rising ADX during a healthy pullback to EMA21 was blocking
                        # valid entries: ADX naturally dips during retracements even in strong trends.
 EMA_TREND_SLOPE_BARS = 3  # EMA50 must be moving in trade direction over this many bars
 VOL_MA        = 10     # volume average window
 VOL_MULT      = 0.6    # volume must be at least 60% of average
-SPIKE_ATR_MULT     = 1.5  # skip signal if candle range > 1.5× ATR (exhaustion spike)
+SPIKE_ATR_MULT          = 1.5  # skip signal if candle range > 1.5× ATR (exhaustion spike)
+SPIKE_ATR_MULT_TREND    = 2.5  # relaxed spike limit for continuation entries in STRONG_TREND
+                                # (a big breakout candle IS the momentum — blocking it costs the entry)
 SPIKE_LOCKOUT_BARS = 2    # candles to block entries after a massive volume spike
 SPIKE_VOL_MULT     = 4.0  # spike is "massive" if volume > 4× average
 
@@ -66,9 +68,16 @@ class ScalpingStrategy:
         self._cached_df: Optional[pd.DataFrame] = None
         self._spike_lockout_remaining: int = 0  # candles left in post-spike lockout
         self._spike_direction: str = "none"      # 'down' | 'up' — direction of the spike that triggered lockout
-        self._last_signal_was_continuation: bool = False  # set by get_signal()
+        self._last_signal_was_continuation: bool = False       # set by get_signal()
+        self._last_signal_was_exhaustion_reversal: bool = False # set by get_signal()
         self._cross_window_remaining: int = 0   # candles left to treat last cross as active
         self._cross_window_direction: str = "none"  # 'bull' | 'bear' | 'none'
+        # Exhaustion-armed state: set when ADX peak is detected in the current trend.
+        # Entry fires only when the subsequent cross confirms the reversal.
+        self._short_armed: bool = False          # uptrend exhausting → waiting for bear cross
+        self._long_armed: bool = False           # downtrend exhausting → waiting for bull cross
+        self._short_armed_remaining: int = 0    # candles before SHORT arm expires
+        self._long_armed_remaining: int = 0     # candles before LONG arm expires
 
     def was_continuation(self) -> bool:
         """True if the last non-'none' signal was a continuation (no fresh cross).
@@ -76,6 +85,13 @@ class ScalpingStrategy:
         a continuation — we have no prior position history to know the trend age.
         """
         return self._last_signal_was_continuation
+
+    def was_exhaustion_reversal(self) -> bool:
+        """True if the last non-'none' signal was an exhaustion reversal.
+        Used by bot.py to bypass the ADX >= 40 flip guard — exhaustion reversals
+        fire precisely when ADX is falling, so the guard would always suppress them.
+        """
+        return self._last_signal_was_exhaustion_reversal
 
     def indicator_snapshot(self, state: State) -> Optional[dict]:
         """
@@ -185,6 +201,11 @@ class ScalpingStrategy:
         adx_trend_ok = (row["adx"] >= ADX_TREND_MIN) and adx_rising
         vol_ok       = row["volume"]       >= row["vol_avg"] * VOL_MULT
         spike_ok     = row["candle_range"] <= row["atr"] * SPIKE_ATR_MULT
+        # Continuation entries in STRONG_TREND use a relaxed spike limit:
+        # a large breakout candle is momentum, not exhaustion.
+        regime           = self.market_regime(state)
+        _spike_mult_cont = SPIKE_ATR_MULT_TREND if regime == "STRONG_TREND" else SPIKE_ATR_MULT
+        spike_ok_cont    = row["candle_range"] <= row["atr"] * _spike_mult_cont
         cross        = row["cross"]
 
         # ── Cumulative move guard: block entries at the top/bottom of a staircase pump/dump ──
@@ -375,7 +396,8 @@ class ScalpingStrategy:
             self._spike_direction = "none"  # opposite direction — clear and proceed
 
         # ── 1. Crossover entries (fresh cross signal) ─────────────────────────
-        if cross == "bull" and adx_ok and vol_ok and spike_ok and in_uptrend and bias_long and ema_gap_ok_long and ema_sep_ok and ema50_rising:
+        # Standard cross entries (trend-following, no exhaustion arm needed).
+        if cross == "bull" and adx_ok and vol_ok and spike_ok and in_uptrend and bias_long and ema_gap_ok_long and ema_sep_ok:
             _pb_dist = (close - ema_slow) / atr_val
             log.info(
                 f"SIGNAL long  |  cross=bull  adx={row['adx']:.1f}  "
@@ -383,9 +405,11 @@ class ScalpingStrategy:
                 f"pullback={_pb_dist:.2f}x ATR from EMA21"
             )
             self._last_signal_was_continuation = False
+            self._last_signal_was_exhaustion_reversal = False
+            self._long_armed = False   # consumed
             return "long"
 
-        if cross == "bear" and adx_ok and vol_ok and spike_ok and in_downtrend and bias_short and ema_gap_ok_short and ema_sep_ok and ema50_falling:
+        if cross == "bear" and adx_ok and vol_ok and spike_ok and in_downtrend and bias_short and ema_gap_ok_short and ema_sep_ok:
             _pb_dist = (ema_slow - close) / atr_val
             log.info(
                 f"SIGNAL short |  cross=bear  adx={row['adx']:.1f}  "
@@ -393,13 +417,51 @@ class ScalpingStrategy:
                 f"pullback={_pb_dist:.2f}x ATR from EMA21"
             )
             self._last_signal_was_continuation = False
+            self._last_signal_was_exhaustion_reversal = False
+            self._short_armed = False  # consumed
             return "short"
+
+        # ── 1b. Exhaustion-armed cross entries ────────────────────────────────
+        # Fires when a prior exhaustion detection (ADX peak while still in trend)
+        # armed the flag, and the subsequent EMA cross confirms the reversal.
+        # No adx_ok / ema50 slope / spike_ok / ema_sep_ok required:
+        #   - ADX is naturally low post-exhaustion (peaked and falling by definition)
+        #   - EMA50 slope lags the actual reversal
+        #   - EMA sep is small at the cross (EMA8 just flipped through EMA21)
+        #   - Reversal candle is often slightly larger than normal (exhaustion momentum)
+        #     — filtering at 1.5× ATR would block legitimate entries or force a
+        #       1-candle delay via cross window at a worse price
+        if cross == "bear" and self._short_armed and vol_ok and in_downtrend:
+            _pb_dist = (ema_slow - close) / atr_val
+            log.info(
+                f"SIGNAL short |  exhaustion cross=bear  armed_remaining={self._short_armed_remaining}"
+                f"  adx={row['adx']:.1f}  ema50={ema_trend:.4f}  close={close:.4f}"
+                f"  pullback={_pb_dist:.2f}x ATR from EMA21"
+            )
+            self._short_armed = False
+            self._short_armed_remaining = 0
+            self._last_signal_was_continuation = False
+            self._last_signal_was_exhaustion_reversal = True
+            return "short"
+
+        if cross == "bull" and self._long_armed and vol_ok and in_uptrend:
+            _pb_dist = (close - ema_slow) / atr_val
+            log.info(
+                f"SIGNAL long  |  exhaustion cross=bull  armed_remaining={self._long_armed_remaining}"
+                f"  adx={row['adx']:.1f}  ema50={ema_trend:.4f}  close={close:.4f}"
+                f"  pullback={_pb_dist:.2f}x ATR from EMA21"
+            )
+            self._long_armed = False
+            self._long_armed_remaining = 0
+            self._last_signal_was_continuation = False
+            self._last_signal_was_exhaustion_reversal = True
+            return "long"
 
         # ── 2. Trend continuation entries (no fresh cross needed) ─────────────
         # Re-enters after SL+cooldown when trend is still strongly intact.
         # Requires ADX >= 50 (vs 40 for crossover) to avoid choppy re-entries.
         # EMA50 bias still enforced — never trade against long-term trend.
-        if in_uptrend and adx_trend_ok and vol_ok and spike_ok and bias_long and ema_gap_ok_long and ema_sep_ok and ema50_rising:
+        if in_uptrend and adx_trend_ok and vol_ok and spike_ok_cont and bias_long and ema_gap_ok_long and ema_sep_ok and ema50_rising:
             if _pump_extended:
                 log.debug(
                     f"CUMULATIVE MOVE filtered (long)  net={_net_move:.5f}  limit={_atr_limit:.5f}"
@@ -412,9 +474,10 @@ class ScalpingStrategy:
                     f"pullback={_pb_dist:.2f}x ATR from EMA21"
                 )
                 self._last_signal_was_continuation = True
+                self._last_signal_was_exhaustion_reversal = False
                 return "long"
 
-        if in_downtrend and adx_trend_ok and vol_ok and spike_ok and bias_short and ema_gap_ok_short and ema_sep_ok and ema50_falling:
+        if in_downtrend and adx_trend_ok and vol_ok and spike_ok_cont and bias_short and ema_gap_ok_short and ema_sep_ok and ema50_falling:
             if _dump_extended:
                 log.debug(
                     f"CUMULATIVE MOVE filtered (short)  net={_net_move:.5f}  limit={-_atr_limit:.5f}"
@@ -427,7 +490,87 @@ class ScalpingStrategy:
                     f"pullback={_pb_dist:.2f}x ATR from EMA21"
                 )
                 self._last_signal_was_continuation = True
+                self._last_signal_was_exhaustion_reversal = False
                 return "short"
+
+        # ── 3. Exhaustion arming ──────────────────────────────────────────────
+        # Detects when the CURRENT trend is losing momentum (ADX peak while still
+        # in that trend) and arms a flag. The actual entry fires in section 1b
+        # when the subsequent EMA cross confirms the reversal.
+        #
+        # ARM SHORT: uptrend (ema_fast > ema_slow) exhausting
+        #   - ADX formed a local peak and is now falling 2+ bars
+        #   - adx_peak >= 30 (ignore micro-noise peaks)
+        #
+        # ARM LONG: downtrend (ema_fast < ema_slow) exhausting
+        #   - Same ADX peak pattern
+        #
+        # Needs 4 ADX values: peak bar [-3], one bar before [-4], two falls [-2],[-1]
+        _EXHAUSTION_ARM_WINDOW = 15   # candles the arm stays active waiting for cross
+        _EXHAUSTION_ADX_FLOOR  = 40   # minimum adx_peak to arm — blocks clear range noise (peaks < 40)
+                                      # while keeping marginal-momentum entries (40-49) that still win
+
+        if len(df) >= 4:
+            _adx_n4 = df["adx"].iloc[-4]
+            _adx_n3 = df["adx"].iloc[-3]
+            _adx_n2 = df["adx"].iloc[-2]
+            _adx_n1 = df["adx"].iloc[-1]
+            _exh_adx_peaked_falling = (
+                _adx_n4 < _adx_n3 and   # ADX was rising into the peak
+                _adx_n3 > _adx_n2 and   # peak bar
+                _adx_n2 > _adx_n1        # falling 2nd bar (2+ consecutive falls)
+            )
+            _ema21_n2 = df["ema_slow"].iloc[-2]
+            _ema21_n1 = df["ema_slow"].iloc[-1]
+            _ema21_ticked_down = _ema21_n1 < _ema21_n2
+            _ema21_ticked_up   = _ema21_n1 > _ema21_n2
+        else:
+            _exh_adx_peaked_falling = False
+            _ema21_ticked_down = False
+            _ema21_ticked_up   = False
+
+        if _exh_adx_peaked_falling:
+            log.debug(
+                f"EXHAUSTION check  adx_peak={_adx_n3:.1f}  adx_now={_adx_n1:.1f}"
+                f"  ema21_tick={'down' if _ema21_ticked_down else 'up' if _ema21_ticked_up else 'flat'}"
+                f"  ema8>21={in_uptrend}"
+            )
+
+        # Arm SHORT: ADX peaked while in uptrend → expect bear cross soon
+        if _exh_adx_peaked_falling and in_uptrend and _adx_n3 >= _EXHAUSTION_ADX_FLOOR:
+            if not self._short_armed:
+                log.debug(
+                    f"EXHAUSTION ARM short  adx_peak={_adx_n3:.1f}  adx_now={_adx_n1:.1f}"
+                    f"  ema8>21={in_uptrend}  window={_EXHAUSTION_ARM_WINDOW}"
+                )
+            self._short_armed = True
+            self._short_armed_remaining = _EXHAUSTION_ARM_WINDOW
+            self._long_armed = False   # cancel opposite arm
+
+        # Arm LONG: ADX peaked while in downtrend → expect bull cross soon
+        if _exh_adx_peaked_falling and in_downtrend and _adx_n3 >= _EXHAUSTION_ADX_FLOOR:
+            if not self._long_armed:
+                log.debug(
+                    f"EXHAUSTION ARM long  adx_peak={_adx_n3:.1f}  adx_now={_adx_n1:.1f}"
+                    f"  ema8>21={in_uptrend}  window={_EXHAUSTION_ARM_WINDOW}"
+                )
+            self._long_armed = True
+            self._long_armed_remaining = _EXHAUSTION_ARM_WINDOW
+            self._short_armed = False  # cancel opposite arm
+
+        # Tick down arm timeouts — only decrement if arm was NOT just set this
+        # candle (remaining would be exactly _EXHAUSTION_ARM_WINDOW). This prevents
+        # the arm losing one count on the same candle it was armed.
+        if self._short_armed and self._short_armed_remaining < _EXHAUSTION_ARM_WINDOW:
+            self._short_armed_remaining -= 1
+            if self._short_armed_remaining <= 0:
+                log.debug("EXHAUSTION ARM short expired — no bear cross in window")
+                self._short_armed = False
+        if self._long_armed and self._long_armed_remaining < _EXHAUSTION_ARM_WINDOW:
+            self._long_armed_remaining -= 1
+            if self._long_armed_remaining <= 0:
+                log.debug("EXHAUSTION ARM long expired — no bull cross in window")
+                self._long_armed = False
 
         return "none"
 

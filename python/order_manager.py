@@ -55,12 +55,12 @@ class OrderManager:
         if qty <= 0:
             log.warning(f"open skipped: position_size=0  balance={balance:.2f}  entry={entry:.4f}")
             return None
-        tp  = rm.tp_price(entry, signal, atr=atr, regime=regime)
         sl  = rm.sl_price(entry, signal, atr=atr, regime=regime)
+        tp  = sl  # no fixed TP — trail at +2R is the only exit; tp field kept for dataclass compat
 
         log.info(
             f"open_position  regime={regime}  signal={signal}  "
-            f"entry={entry:.4f}  tp={tp:.4f}  sl={sl:.4f}  qty={qty}"
+            f"entry={entry:.4f}  sl={sl:.4f}  qty={qty}"
         )
 
         if cfg.is_paper():
@@ -165,29 +165,15 @@ class OrderManager:
         if rm.update_trail(pos, price, live_atr=state.live_atr):
             hit = "trail_tp"
 
-        # ── Fixed TP / SL (still used before trail activates) ─────────────────
+        # ── Hard SL (fires immediately — real loss protection) ────────────────
+        # No fixed TP: exits are trail stop only (arms at +2R, 1R callback).
         if hit is None:
             if pos.side == "long":
-                if not pos.trail_active and price >= pos.tp_price:
-                    hit = "tp"
-                elif price <= pos.sl_price:
-                    # Breakeven SL: only exit on candle close, not on a wick tick.
-                    # Original hard SL fires immediately (real loss protection).
-                    if pos.sl_price >= pos.entry_price:
-                        if state.last_candle_close and state.last_candle_close <= pos.sl_price:
-                            hit = "sl"
-                    else:
-                        hit = "sl"
+                if price <= pos.sl_price:
+                    hit = "sl"
             else:  # short
-                if not pos.trail_active and price <= pos.tp_price:
-                    hit = "tp"
-                elif price >= pos.sl_price:
-                    # Breakeven SL: only exit on candle close, not on a wick tick.
-                    if pos.sl_price <= pos.entry_price:
-                        if state.last_candle_close and state.last_candle_close >= pos.sl_price:
-                            hit = "sl"
-                    else:
-                        hit = "sl"
+                if price >= pos.sl_price:
+                    hit = "sl"
 
         if hit:
             state.is_closing = True
