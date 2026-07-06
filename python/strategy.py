@@ -53,11 +53,13 @@ SPIKE_LOCKOUT_BARS = 2    # candles to block entries after a massive volume spik
 SPIKE_VOL_MULT     = 4.0  # spike is "massive" if volume > 4× average
 
 # Warm-up: need at least this many closed candles before any signal.
-# EMA50 converges faster than EMA100 (higher alpha: 2/51 vs 2/101), so a
-# full 50-bar wait is unnecessary. After ~35 bars the initial-value bias
-# is below 25% — reliable enough for bias_long / bias_short direction.
-# (26 was too short: EMA50 still 35% noise at restart.)
-_MIN_BARS = max(EMA_SLOW, ADX_PERIOD, VOL_MA) + 14  # → 35 candles
+# Exhaustion entries (section 1b) bypass EMA50 bias/slope — those require
+# EMA50 convergence (~35 bars) but exhaustion only needs:
+#   - ADX stable (14 bars + small buffer)
+#   - EMA8/21 cross reliable (21 bars)
+#   - vol_avg median (10 bars)
+# +4 gives ADX room to form its first peak/fall pattern (needs 4 ADX values).
+_MIN_BARS = max(EMA_SLOW, ADX_PERIOD, VOL_MA) + 4  # → 25 candles (~2h05m)
 
 
 class ScalpingStrategy:
@@ -70,6 +72,8 @@ class ScalpingStrategy:
         self._spike_direction: str = "none"      # 'down' | 'up' — direction of the spike that triggered lockout
         self._last_signal_was_continuation: bool = False       # set by get_signal()
         self._last_signal_was_exhaustion_reversal: bool = False # set by get_signal()
+        self._last_signal_was_di_snap: bool = False             # set by get_signal()
+        self._di_snap_levels: dict = {}                         # {"sl": float, "tp": float}
         self._cross_window_remaining: int = 0   # candles left to treat last cross as active
         self._cross_window_direction: str = "none"  # 'bull' | 'bear' | 'none'
         # Exhaustion-armed state: set when ADX peak is detected in the current trend.
@@ -93,6 +97,21 @@ class ScalpingStrategy:
         """
         return self._last_signal_was_exhaustion_reversal
 
+    def was_di_snap(self) -> bool:
+        """True if the last signal was a DI-snap exhaustion entry.
+        Used by order_manager to apply the DI-snap specific SL/TP:
+          SL = trigger candle high/low
+          TP = EMA21 at signal time (fixed mean-reversion target)
+        """
+        return self._last_signal_was_di_snap
+
+    def di_snap_levels(self) -> dict:
+        """Return the SL and TP levels captured at the time of the DI-snap signal.
+        sl  = trigger candle high (short) or low (long)
+        tp  = EMA21 at signal time
+        """
+        return self._di_snap_levels
+
     def indicator_snapshot(self, state: State) -> Optional[dict]:
         """
         Compute all indicators and return them as a dict.
@@ -111,6 +130,8 @@ class ScalpingStrategy:
             "ema_slow":  round(row["ema_slow"],  cfg.PRICE_PRECISION),
             "ema_trend": round(row["ema_trend"], cfg.PRICE_PRECISION),
             "adx":       round(row["adx"],       2),
+            "plus_di":   round(row["plus_di"],   2),
+            "minus_di":  round(row["minus_di"],  2),
             "atr":       round(row["atr"],       cfg.PRICE_PRECISION + 1),
             "volume":    round(row["volume"],    2),
             "vol_avg":   round(row["vol_avg"],   2),
@@ -406,6 +427,7 @@ class ScalpingStrategy:
             )
             self._last_signal_was_continuation = False
             self._last_signal_was_exhaustion_reversal = False
+            self._last_signal_was_di_snap = False
             self._long_armed = False   # consumed
             return "long"
 
@@ -418,6 +440,7 @@ class ScalpingStrategy:
             )
             self._last_signal_was_continuation = False
             self._last_signal_was_exhaustion_reversal = False
+            self._last_signal_was_di_snap = False
             self._short_armed = False  # consumed
             return "short"
 
@@ -442,6 +465,7 @@ class ScalpingStrategy:
             self._short_armed_remaining = 0
             self._last_signal_was_continuation = False
             self._last_signal_was_exhaustion_reversal = True
+            self._last_signal_was_di_snap = False
             return "short"
 
         if cross == "bull" and self._long_armed and vol_ok and in_uptrend:
@@ -455,7 +479,89 @@ class ScalpingStrategy:
             self._long_armed_remaining = 0
             self._last_signal_was_continuation = False
             self._last_signal_was_exhaustion_reversal = True
+            self._last_signal_was_di_snap = False
             return "long"
+
+        # ── 1c. DI-snap exhaustion entries ────────────────────────────────────
+        # Fires immediately when directional pressure hits an extreme and snaps:
+        #   LONG:  -DI > 35 (extreme bearish pressure)
+        #          AND -DI peaked and fell 2 consecutive bars (-DI[-3] > -DI[-2] > -DI[-1])
+        #          AND close < ema_slow (price stretched below EMA21 = real downside stretch)
+        #          AND adx > 20 (some real momentum behind the move, not flat noise)
+        #          AND vol_ok (volume confirmed)
+        #   SHORT: mirror with +DI
+        # No EMA50 filter: these are mean-reversion snaps — EMA50 lags the reversal.
+        # No spike filter: an outsized candle IS the exhaustion we're trading against.
+        # TP target is EMA21 (handled by order_manager/risk_manager).
+        _DI_EXTREMITY  = 35.0   # DI must reach this level to qualify as a true extreme
+        _DI_ADX_FLOOR  = 20.0   # ADX floor — avoids firing during pure flat/ranging noise
+
+        if len(df) >= 3:
+            _plus_di_n3  = df["plus_di"].iloc[-3]
+            _plus_di_n2  = df["plus_di"].iloc[-2]
+            _plus_di_n1  = df["plus_di"].iloc[-1]
+            _minus_di_n3 = df["minus_di"].iloc[-3]
+            _minus_di_n2 = df["minus_di"].iloc[-2]
+            _minus_di_n1 = df["minus_di"].iloc[-1]
+        else:
+            _plus_di_n3 = _plus_di_n2 = _plus_di_n1 = 0.0
+            _minus_di_n3 = _minus_di_n2 = _minus_di_n1 = 0.0
+
+        _plus_di_snapped  = (_plus_di_n3  > _plus_di_n2  > _plus_di_n1)   # 2-bar fall from peak
+        _minus_di_snapped = (_minus_di_n3 > _minus_di_n2 > _minus_di_n1)  # 2-bar fall from peak
+        _adx_floor_ok     = row["adx"] >= _DI_ADX_FLOOR
+
+        # DI-snap LONG: bearish pressure exhausted, price stretched below EMA21
+        if (
+            _minus_di_n3 >= _DI_EXTREMITY   # peak was extreme
+            and _minus_di_snapped            # 2-bar confirmed snap down
+            and close < ema_slow            # price stretched below EMA21
+            and _adx_floor_ok
+            and vol_ok
+        ):
+            _snap_sl = float(df["low"].iloc[-1])   # low of the signal candle — invalidation level
+            _snap_tp = float(ema_slow)             # EMA21 = mean-reversion target
+            log.info(
+                f"SIGNAL long  |  DI-snap exhaustion"
+                f"  -DI={_minus_di_n3:.1f}→{_minus_di_n2:.1f}→{_minus_di_n1:.1f}"
+                f"  adx={row['adx']:.1f}  close={close:.4f}  ema21={ema_slow:.4f}"
+                f"  sl={_snap_sl:.4f}  tp={_snap_tp:.4f}"
+            )
+            self._last_signal_was_continuation = False
+            self._last_signal_was_exhaustion_reversal = True
+            self._last_signal_was_di_snap = True
+            self._di_snap_levels = {"sl": _snap_sl, "tp": _snap_tp}
+            # Cancel ADX-peak arm — same exhaustion event, prevent a conflicting
+            # FLIP signal if the EMA cross arrives while this position is open.
+            self._short_armed = False
+            self._short_armed_remaining = 0
+            return "long"
+
+        # DI-snap SHORT: bullish pressure exhausted, price stretched above EMA21
+        if (
+            _plus_di_n3 >= _DI_EXTREMITY    # peak was extreme
+            and _plus_di_snapped             # 2-bar confirmed snap down
+            and close > ema_slow            # price stretched above EMA21
+            and _adx_floor_ok
+            and vol_ok
+        ):
+            _snap_sl = float(df["high"].iloc[-1])  # high of the signal candle — invalidation level
+            _snap_tp = float(ema_slow)             # EMA21 = mean-reversion target
+            log.info(
+                f"SIGNAL short |  DI-snap exhaustion"
+                f"  +DI={_plus_di_n3:.1f}→{_plus_di_n2:.1f}→{_plus_di_n1:.1f}"
+                f"  adx={row['adx']:.1f}  close={close:.4f}  ema21={ema_slow:.4f}"
+                f"  sl={_snap_sl:.4f}  tp={_snap_tp:.4f}"
+            )
+            self._last_signal_was_continuation = False
+            self._last_signal_was_exhaustion_reversal = True
+            self._last_signal_was_di_snap = True
+            self._di_snap_levels = {"sl": _snap_sl, "tp": _snap_tp}
+            # Cancel ADX-peak arm — same exhaustion event, prevent a conflicting
+            # FLIP signal if the EMA cross arrives while this position is open.
+            self._long_armed = False
+            self._long_armed_remaining = 0
+            return "short"
 
         # ── 2. Trend continuation entries (no fresh cross needed) ─────────────
         # Re-enters after SL+cooldown when trend is still strongly intact.
@@ -475,6 +581,7 @@ class ScalpingStrategy:
                 )
                 self._last_signal_was_continuation = True
                 self._last_signal_was_exhaustion_reversal = False
+                self._last_signal_was_di_snap = False
                 return "long"
 
         if in_downtrend and adx_trend_ok and vol_ok and spike_ok_cont and bias_short and ema_gap_ok_short and ema_sep_ok and ema50_falling:
@@ -491,6 +598,7 @@ class ScalpingStrategy:
                 )
                 self._last_signal_was_continuation = True
                 self._last_signal_was_exhaustion_reversal = False
+                self._last_signal_was_di_snap = False
                 return "short"
 
         # ── 3. Exhaustion arming ──────────────────────────────────────────────
@@ -507,8 +615,8 @@ class ScalpingStrategy:
         #
         # Needs 4 ADX values: peak bar [-3], one bar before [-4], two falls [-2],[-1]
         _EXHAUSTION_ARM_WINDOW = 15   # candles the arm stays active waiting for cross
-        _EXHAUSTION_ADX_FLOOR  = 40   # minimum adx_peak to arm — blocks clear range noise (peaks < 40)
-                                      # while keeping marginal-momentum entries (40-49) that still win
+        _EXHAUSTION_ADX_FLOOR  = 20   # minimum adx_peak to arm — on 5m ADX peaks slower/lower;
+                                      # 20 still filters pure noise while catching real exhaustion moves
 
         if len(df) >= 4:
             _adx_n4 = df["adx"].iloc[-4]
@@ -610,8 +718,10 @@ def _atr(df: pd.DataFrame, period: int) -> pd.Series:
     return tr.ewm(span=period, adjust=False).mean()
 
 
-def _adx(df: pd.DataFrame, period: int) -> pd.Series:
-    """Wilder-smoothed ADX (no external deps)."""
+def _adx(df: pd.DataFrame, period: int) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Wilder-smoothed ADX + DI lines (no external deps).
+    Returns (adx, plus_di, minus_di).
+    """
     high, low, prev_close = df["high"], df["low"], df["close"].shift(1)
 
     up   = high - high.shift(1)
@@ -633,7 +743,8 @@ def _adx(df: pd.DataFrame, period: int) -> pd.Series:
     minus_di = 100 * smoothed_minus_dm / smoothed_tr.replace(0, float("nan"))
 
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, float("nan"))
-    return dx.ewm(span=period, adjust=False).mean().fillna(0)
+    adx = dx.ewm(span=period, adjust=False).mean().fillna(0)
+    return adx, plus_di.fillna(0), minus_di.fillna(0)
 
 
 def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -643,7 +754,7 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ema_slow"]     = _ema(df["close"], EMA_SLOW)
     df["ema_trend"]    = _ema(df["close"], EMA_TREND)
     df["atr"]          = _atr(df, cfg.ATR_PERIOD)
-    df["adx"]          = _adx(df, ADX_PERIOD)
+    df["adx"], df["plus_di"], df["minus_di"] = _adx(df, ADX_PERIOD)
     df["vol_avg"]      = df["volume"].rolling(VOL_MA, min_periods=1).median()
     df["candle_range"] = df["high"] - df["low"]
 

@@ -55,6 +55,11 @@ class Position:
     trail_active:    bool  = False  # True once activate threshold is crossed
     trail_stop:      float = 0.0   # current trailing stop level
 
+    # DI-snap exhaustion entries use a fixed TP (EMA21 at entry) and a tight SL
+    # (trigger candle high/low) instead of the ATR trail system.
+    is_di_snap:      bool  = False  # True if this position was opened by DI-snap logic
+    di_snap_tp:      float = 0.0    # fixed TP = EMA21 at entry time
+
 
 # ── Main state object ──────────────────────────────────────────────────────────
 

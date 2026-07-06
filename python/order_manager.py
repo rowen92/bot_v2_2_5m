@@ -55,13 +55,25 @@ class OrderManager:
         if qty <= 0:
             log.warning(f"open skipped: position_size=0  balance={balance:.2f}  entry={entry:.4f}")
             return None
-        sl  = rm.sl_price(entry, signal, atr=atr, regime=regime)
-        tp  = sl  # no fixed TP — trail at +2R is the only exit; tp field kept for dataclass compat
 
-        log.info(
-            f"open_position  regime={regime}  signal={signal}  "
-            f"entry={entry:.4f}  sl={sl:.4f}  qty={qty}"
-        )
+        # DI-snap entries use fixed SL (trigger candle high/low) and fixed TP (EMA21).
+        # All other entries use ATR-based SL + trail (no fixed TP).
+        is_di_snap = strategy is not None and strategy.was_di_snap()
+        if is_di_snap:
+            snap = strategy.di_snap_levels()
+            sl   = snap["sl"]
+            tp   = snap["tp"]
+            log.info(
+                f"open_position  regime={regime}  signal={signal}  [DI-snap]"
+                f"  entry={entry:.4f}  sl={sl:.4f}  tp={tp:.4f}  qty={qty}"
+            )
+        else:
+            sl = rm.sl_price(entry, signal, atr=atr, regime=regime)
+            tp = sl  # no fixed TP — trail at +2R is the only exit; tp field kept for dataclass compat
+            log.info(
+                f"open_position  regime={regime}  signal={signal}  "
+                f"entry={entry:.4f}  sl={sl:.4f}  qty={qty}"
+            )
 
         if cfg.is_paper():
             pos = self._paper_open(signal, entry, qty, tp, sl, state)
@@ -69,9 +81,11 @@ class OrderManager:
             pos = await self._live_open(signal, entry, qty, tp, sl, client)
 
         if pos:
-            pos.best_price = entry  # initialise trailing high-water-mark
-            pos.atr        = atr    # stored so update_trail() can use ATR-based distances
-            pos.regime     = regime  # frozen at entry — governs trail for the life of this position
+            pos.best_price  = entry    # initialise trailing high-water-mark
+            pos.atr         = atr      # stored so update_trail() can use ATR-based distances
+            pos.regime      = regime   # frozen at entry — governs trail for the life of this position
+            pos.is_di_snap  = is_di_snap
+            pos.di_snap_tp  = tp if is_di_snap else 0.0
             state.position = pos
             state.first_trade_done = True  # unlock continuation entries on next candle
             tlog.log_open(signal, entry, qty, tp, sl, cfg.TRADING_MODE, regime=regime)
@@ -161,19 +175,32 @@ class OrderManager:
 
         hit = None
 
-        # ── Trailing TP (takes priority over fixed TP once active) ────────────
-        if rm.update_trail(pos, price, live_atr=state.live_atr):
-            hit = "trail_tp"
-
-        # ── Hard SL (fires immediately — real loss protection) ────────────────
-        # No fixed TP: exits are trail stop only (arms at +2R, 1R callback).
-        if hit is None:
+        if pos.is_di_snap:
+            # ── DI-snap exits: fixed TP at EMA21, hard SL at candle high/low ──
             if pos.side == "long":
-                if price <= pos.sl_price:
+                if price >= pos.di_snap_tp:
+                    hit = "tp"
+                elif price <= pos.sl_price:
                     hit = "sl"
             else:  # short
-                if price >= pos.sl_price:
+                if price <= pos.di_snap_tp:
+                    hit = "tp"
+                elif price >= pos.sl_price:
                     hit = "sl"
+        else:
+            # ── Trailing TP (takes priority over fixed TP once active) ────────
+            if rm.update_trail(pos, price, live_atr=state.live_atr):
+                hit = "trail_tp"
+
+            # ── Hard SL (fires immediately — real loss protection) ────────────
+            # No fixed TP: exits are trail stop only (arms at +2R, 1R callback).
+            if hit is None:
+                if pos.side == "long":
+                    if price <= pos.sl_price:
+                        hit = "sl"
+                else:  # short
+                    if price >= pos.sl_price:
+                        hit = "sl"
 
         if hit:
             state.is_closing = True
