@@ -112,6 +112,15 @@ class ScalpingStrategy:
         """
         return self._di_snap_levels
 
+    def last_ema21(self) -> float:
+        """Return EMA21 (ema_slow) from the most recently cached DataFrame.
+        Used by order_manager to set TP2 for exhaustion-armed entries at open.
+        Returns 0.0 if the DataFrame is not yet available.
+        """
+        if self._cached_df is None or self._cached_df.empty:
+            return 0.0
+        return float(self._cached_df["ema_slow"].iloc[-1])
+
     def indicator_snapshot(self, state: State) -> Optional[dict]:
         """
         Compute all indicators and return them as a dict.
@@ -141,24 +150,29 @@ class ScalpingStrategy:
 
     def market_regime(self, state: State) -> str:
         """
-        Classify current market condition using EMA + ADX.
+        Classify current market condition using EMA separation + ADX.
         Returns: 'STRONG_TREND' | 'TREND' | 'CHOP'
 
         Used by risk_manager to select dynamic SL / TP / trail multipliers.
 
-        STRONG_TREND — ADX >= 50 and EMA8 is at least 1.5×ATR away from EMA50
-                       → wide SL to breathe, trail activates sooner, tight callback
-        TREND        — ADX 45-49 and EMA8/21 clearly aligned
-                       → normal SL and trail settings
-        CHOP         — ADX < 45 (marginal momentum — crossover entries at ADX 40-44
-                       are blocked entirely by CHOP_BLOCK in bot.py; this regime
-                       is returned for informational logging only)
-                       → entries skipped (CHOP_BLOCK=true)
+        Calibrated from WLD 5m live data (24h, 300 candles):
+          ADX on this asset lives in 20–67. The old ADX≥50 TREND threshold meant
+          ~89% of candles were CHOP, even when EMA8 was visibly separated from EMA50
+          and directional moves were clearly trending (ADX 35–49, ema_sep ≥ 1.0×ATR).
 
-        Boundary alignment with get_signal:
-          ADX_MIN=40 (crossover entry floor) → entries at ADX 40-44 → CHOP params
-          ADX 45-49                          → entries here        → TREND params
-          ADX >= 50 (continuation floor)     → entries here        → STRONG_TREND (if ema_sep ok)
+        STRONG_TREND — ADX ≥ 50 AND ema_sep ≥ 1.5×ATR
+                       Strong momentum + wide EMA gap. ~11% of candles.
+                       → widest SL (2.5×ATR), trail activates sooner
+
+        TREND        — ADX ≥ 35 AND ema_sep ≥ 1.0×ATR
+                       Real directional move at moderate momentum. ~35% of candles.
+                       Captures the ADX 35–49 sessions (T12, T13, T17 all fired here
+                       and had genuine trending room — were mislabelled CHOP before).
+                       → normal SL (2.0×ATR)
+
+        CHOP         — everything else (ADX < 35, or narrow ema_sep despite high ADX)
+                       True low-momentum / equilibrium market. ~54% of candles.
+                       → tight SL (1.5×ATR), flat TP exits
         """
         df = self._cached_df
         if df is None or df.empty:
@@ -168,29 +182,25 @@ class ScalpingStrategy:
         adx       = row["adx"]
         atr       = row["atr"]
         ema_fast  = row["ema_fast"]
-        ema_slow  = row["ema_slow"]   # used for ema_aligned (mirrors get_signal's ema_gap_ok)
+        ema_slow  = row["ema_slow"]
         ema_trend = row["ema_trend"]
 
         close          = row["close"]
-        ema_separation = abs(ema_fast - ema_trend)        # EMA8 distance from EMA50
-        # Mirror the same gap check used in get_signal: price must be >0.5×ATR
-        # from EMA21 — if it isn't, the market is at equilibrium (choppy).
-        ema_aligned = abs(close - ema_slow) > 0.5 * atr
+        ema_separation = abs(ema_fast - ema_trend)   # EMA8 distance from EMA50
 
         if adx >= 50 and ema_separation >= 1.5 * atr:
             regime = "STRONG_TREND"
-        elif adx >= 50 and ema_aligned:
+        elif adx >= 35 and ema_separation >= 1.0 * atr:
+            # ADX 35–49 with a meaningful EMA8/EMA50 gap = real trend, not chop.
+            # ema_sep ≥ 1.0×ATR ensures the separation is genuine (not noise at ADX 35).
             regime = "TREND"
         else:
-            # ADX < 50: crossover entries at ADX 40-49 get CHOP risk params
-            # (tighter SL/TP). ADX_TREND_MIN=55 still guards continuations.
-            # ADX 45-49 was TREND before — raised to 50 to stop marginal-momentum
-            # FLIP entries from opening with TREND-wide stops (WLD T2/T4 losses).
             regime = "CHOP"
 
         log.debug(
             f"market_regime={regime}  adx={adx:.1f}  "
-            f"ema_sep={ema_separation:.5f}  atr={atr:.5f}  ema_aligned={ema_aligned}"
+            f"ema_sep={ema_separation:.5f}  ema_sep_atr={ema_separation/atr:.2f}x"
+            f"  atr={atr:.5f}"
         )
         return regime
 
@@ -459,10 +469,14 @@ class ScalpingStrategy:
         #   - in_downtrend / in_uptrend: EMA8/21 alignment still required
         #   - vol_ok: volume confirmation still required
         #
-        # ADX slope, EMA50 slope, spike filter still skipped — same reasoning as before:
-        #   ADX is naturally falling post-exhaustion; EMA50 slope lags; exhaustion
-        #   candles are often larger than normal.
-        if self._short_armed and vol_ok and in_uptrend and ema_sep_ok and close > ema_slow:
+        # ADX slope and spike filter still skipped — same reasoning as before:
+        #   ADX is naturally falling post-exhaustion; exhaustion candles are often larger than normal.
+        # EMA50 slope IS now required: without it, armed signals fire into counter-trend
+        # moves where EMA50 is actively running against us (T22: SHORT armed while EMA50
+        # rising → −1.28; same pattern blocks bad LONGs during downtrends).
+        # Note: ema50_rising for SHORT means the exhausted upmove had real momentum behind
+        # it — EMA50 was genuinely rising before the ADX peak, making the reversal valid.
+        if self._short_armed and vol_ok and in_uptrend and ema_sep_ok and close > ema_slow and ema50_rising:
             _pb_dist = (close - ema_slow) / atr_val
             log.info(
                 f"SIGNAL short |  exhaustion armed  armed_remaining={self._short_armed_remaining}"
@@ -476,7 +490,7 @@ class ScalpingStrategy:
             self._last_signal_was_di_snap = False
             return "short"
 
-        if self._long_armed and vol_ok and in_downtrend and ema_sep_ok and close < ema_slow:
+        if self._long_armed and vol_ok and in_downtrend and ema_sep_ok and close < ema_slow and ema50_falling:
             _pb_dist = (ema_slow - close) / atr_val
             log.info(
                 f"SIGNAL long  |  exhaustion armed  armed_remaining={self._long_armed_remaining}"
@@ -520,15 +534,19 @@ class ScalpingStrategy:
         _adx_floor_ok     = row["adx"] >= _DI_ADX_FLOOR
 
         # DI-snap LONG: bearish pressure exhausted, price stretched below EMA21
+        # ema50_falling required: confirms the dominant downmove was real and is now
+        # exhausting — prevents firing LONG snap entries during uptrends where -DI
+        # briefly spikes on a pullback (T2, T4, T11, T14, T15, T16 patterns).
         if (
             _minus_di_n3 >= _DI_EXTREMITY   # peak was extreme
             and _minus_di_snapped            # 2-bar confirmed snap down
             and close < ema_slow            # price stretched below EMA21
             and _adx_floor_ok
             and vol_ok
+            and ema50_falling               # EMA50 must confirm dominant downtrend
         ):
-            _snap_sl = float(df["low"].iloc[-1])   # low of the signal candle — invalidation level
-            _snap_tp = float(ema_slow)             # EMA21 = mean-reversion target
+            _snap_sl = close - 0.5 * atr_val        # ATR-based SL: gives breathing room below entry
+            _snap_tp = float(ema_slow)              # EMA21 = mean-reversion target
             log.info(
                 f"SIGNAL long  |  DI-snap exhaustion"
                 f"  -DI={_minus_di_n3:.1f}→{_minus_di_n2:.1f}→{_minus_di_n1:.1f}"
@@ -546,15 +564,19 @@ class ScalpingStrategy:
             return "long"
 
         # DI-snap SHORT: bullish pressure exhausted, price stretched above EMA21
+        # ema50_rising required: confirms the dominant upmove was real and is now
+        # exhausting — prevents firing SHORT snap entries during downtrends where +DI
+        # briefly spikes on a dead-cat bounce (T18, T19, T20 patterns).
         if (
             _plus_di_n3 >= _DI_EXTREMITY    # peak was extreme
             and _plus_di_snapped             # 2-bar confirmed snap down
             and close > ema_slow            # price stretched above EMA21
             and _adx_floor_ok
             and vol_ok
+            and ema50_rising                # EMA50 must confirm dominant uptrend
         ):
-            _snap_sl = float(df["high"].iloc[-1])  # high of the signal candle — invalidation level
-            _snap_tp = float(ema_slow)             # EMA21 = mean-reversion target
+            _snap_sl = close + 0.5 * atr_val        # ATR-based SL: gives breathing room above entry
+            _snap_tp = float(ema_slow)              # EMA21 = mean-reversion target
             log.info(
                 f"SIGNAL short |  DI-snap exhaustion"
                 f"  +DI={_plus_di_n3:.1f}→{_plus_di_n2:.1f}→{_plus_di_n1:.1f}"

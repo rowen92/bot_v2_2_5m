@@ -89,7 +89,20 @@ class OrderManager:
             pos.is_di_snap          = is_di_snap
             pos.di_snap_tp          = tp if is_di_snap else 0.0
             pos.is_exhaustion_armed = is_exhaustion_armed
-            pos.ema21_trail_stop    = 0.0      # initialised to 0; set on first candle close
+            pos.ema21_trail_stop    = 0.0
+
+            # Flat single TP for exhaustion-armed entries — frozen at open.
+            # TP = entry ± 1.5×ATR  → full close, booked immediately as a win.
+            # FLIP still takes priority if an opposite signal fires first.
+            # SL is ~1×ATR away (CHOP regime) → RR ≈ 1.5:1
+            if is_exhaustion_armed and atr:
+                if signal == "long":
+                    pos.tp1_price = entry + 1.5 * atr
+                else:
+                    pos.tp1_price = entry - 1.5 * atr
+                log.info(
+                    f"exhaustion-armed TP  tp={pos.tp1_price:.4f} (+1.5×ATR)  sl={sl:.4f}"
+                )
             state.position = pos
             state.first_trade_done = True  # unlock continuation entries on next candle
             tlog.log_open(signal, entry, qty, tp, sl, cfg.TRADING_MODE, regime=regime)
@@ -162,14 +175,10 @@ class OrderManager:
         self,
         state: State,
         client: Optional[AsyncClient] = None,
-        ema21: float | None = None,
     ) -> None:
         """Check if TP or SL has been touched; close if so.
-
-        `ema21` — EMA21 value from the just-closed candle.  When provided and
-        the position is an exhaustion-armed (1b) entry, the EMA21 trail is
-        updated and checked.  None on tick calls (no new candle) — EMA21 trail
-        only ratchets on candle close, not on every price tick.
+        Called on every price tick. All exit types (flat TP, trail, hard SL)
+        are checked here — no candle-close variant needed.
         """
         pos = state.position
         if pos is None:
@@ -200,20 +209,22 @@ class OrderManager:
                     hit = "sl"
 
         elif pos.is_exhaustion_armed:
-            # ── Exhaustion-armed (1b): EMA21-based trail + hard SL ───────────
-            # EMA21 trail only updates on candle close (when ema21 is passed).
-            # Between candle closes, only the hard SL is checked tick-by-tick.
-            if ema21 is not None:
-                if rm.update_ema21_trail(pos, price, ema21):
-                    hit = "trail_tp"
-            # Hard SL always active
-            if hit is None:
-                if pos.side == "long":
-                    if price <= pos.sl_price:
-                        hit = "sl"
-                else:
-                    if price >= pos.sl_price:
-                        hit = "sl"
+            # ── Exhaustion-armed (1b): flat TP1/TP2 exit — no trail ──────────
+            # In CHOP (ADX 20-49, almost always on WLD 5m), price travels
+            # Single flat TP at +1.5×ATR — full close, booked immediately.
+            # FLIP (opposite signal) takes priority and is handled before this block.
+            # tp1_price is set at open; 0.0 means no TP (degraded warmup state → SL only).
+
+            if pos.side == "long":
+                if pos.tp1_price > 0 and price >= pos.tp1_price:
+                    hit = "tp"
+                elif price <= pos.sl_price:
+                    hit = "sl"
+            else:  # short
+                if pos.tp1_price > 0 and price <= pos.tp1_price:
+                    hit = "tp"
+                elif price >= pos.sl_price:
+                    hit = "sl"
 
         else:
             # ── ATR 1R:2R trailing (crossover + continuation entries) ─────────

@@ -279,81 +279,7 @@ class RiskManager:
         open_fee  = entry      * qty * (cfg.TAKER_FEE_PCT / 100)
         close_fee = exit_price * qty * (cfg.TAKER_FEE_PCT / 100)
         return raw_pnl - open_fee - close_fee
-
-    # ── EMA21 trailing (exhaustion-armed entries) ─────────────────────────────
-
-    def update_ema21_trail(self, pos, mark_price: float, ema21: float) -> bool:
-        """
-        EMA21-based trailing stop for exhaustion-armed (1b) entries.
-
-        Two-phase logic:
-          Phase 1 — trail dormant (ema21_trail_active=False):
-            1b entries start on the WRONG side of EMA21 (LONG enters below EMA21,
-            SHORT enters above). The trail must not fire until price has actually
-            crossed EMA21 — before that only the hard SL protects the trade.
-            Activation: mark_price >= ema21 (LONG) or mark_price <= ema21 (SHORT).
-
-          Phase 2 — trail active (ema21_trail_active=True):
-            ema21_trail_stop ratchets with EMA21 each candle (only in the
-            favourable direction — never lowers for LONG, never raises for SHORT).
-            Exit when price crosses back through ema21_trail_stop.
-
-        Called once per closed candle (not per tick).
-        Returns True when the position should be closed.
-        """
-        if pos.side == "long":
-            # Phase 1: wait for price to cross above EMA21
-            if not pos.ema21_trail_active:
-                if mark_price >= ema21:
-                    pos.ema21_trail_active = True
-                    pos.ema21_trail_stop   = ema21
-                    log.debug(
-                        f"EMA21 trail activated LONG  price={mark_price:.4f}"
-                        f"  ema21={ema21:.4f}  trail_stop={pos.ema21_trail_stop:.4f}"
-                    )
-                return False  # still in phase 1 — hard SL handles protection
-
-            # Phase 2: ratchet UP, exit on cross back below
-            if ema21 > pos.ema21_trail_stop:
-                pos.ema21_trail_stop = ema21
-                log.debug(
-                    f"EMA21 trail ratchet LONG  ema21={ema21:.4f}"
-                    f"  trail_stop={pos.ema21_trail_stop:.4f}"
-                )
-            if mark_price <= pos.ema21_trail_stop:
-                log.info(
-                    f"EMA21 trail exit LONG  price={mark_price:.4f}"
-                    f"  trail_stop={pos.ema21_trail_stop:.4f}"
-                )
-                return True
-
-        else:  # short — enters above EMA21, waits for price to drop below
-            # Phase 1: wait for price to cross below EMA21
-            if not pos.ema21_trail_active:
-                if mark_price <= ema21:
-                    pos.ema21_trail_active = True
-                    pos.ema21_trail_stop   = ema21
-                    log.debug(
-                        f"EMA21 trail activated SHORT  price={mark_price:.4f}"
-                        f"  ema21={ema21:.4f}  trail_stop={pos.ema21_trail_stop:.4f}"
-                    )
-                return False  # still in phase 1
-
-            # Phase 2: ratchet DOWN, exit on cross back above
-            if ema21 < pos.ema21_trail_stop:
-                pos.ema21_trail_stop = ema21
-                log.debug(
-                    f"EMA21 trail ratchet SHORT  ema21={ema21:.4f}"
-                    f"  trail_stop={pos.ema21_trail_stop:.4f}"
-                )
-            if mark_price >= pos.ema21_trail_stop:
-                log.info(
-                    f"EMA21 trail exit SHORT  price={mark_price:.4f}"
-                    f"  trail_stop={pos.ema21_trail_stop:.4f}"
-                )
-                return True
-
-        return False
+    # ── Trailing TP helpers ───────────────────────────────────────────────────
 
     # ── Trailing TP helpers ───────────────────────────────────────────────────
 
@@ -436,8 +362,6 @@ class RiskManager:
                         f"  trail_stop={pos.trail_stop:.4f}"
                         f"  floor=+{(pos.entry_price - pos.trail_stop) / sl_dist:.1f}R"
                     )
-                if new_stop < pos.trail_stop:
-                    pos.trail_stop = new_stop
                 if mark_price >= pos.trail_stop:
                     return True  # close signal
 

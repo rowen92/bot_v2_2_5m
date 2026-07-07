@@ -45,12 +45,6 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
     if indicators.get("atr"):
         state.live_atr = indicators["atr"]
 
-    # Check EMA21 trail on candle close for exhaustion-armed positions.
-    # Pass ema21 so maybe_exit ratchets the trail and checks for an exit.
-    ema21_now = indicators.get("ema_slow")  # ema_slow = EMA21 in strategy snapshot
-    if state.position is not None and state.position.is_exhaustion_armed and ema21_now:
-        await orders.maybe_exit(state, client, ema21=ema21_now)
-
     if signal != "none":
         # Block continuation entries on the very first trade after restart.
         # On a fresh start we have no position history — we don't know how far

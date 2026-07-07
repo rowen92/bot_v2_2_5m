@@ -60,19 +60,26 @@ class Position:
     is_di_snap:      bool  = False  # True if this position was opened by DI-snap logic
     di_snap_tp:      float = 0.0    # fixed TP = EMA21 at entry time
 
-    # Exhaustion-armed entries (1b) trail using EMA21 of the previous closed candle
-    # instead of the ATR 1R:2R system. EMA21 is a natural floor/ceiling for
-    # mean-reversion trades: once price crosses back through EMA21 the trade is done.
+    # Exhaustion-armed entries (1b) use a two-level flat TP exit — no trail.
+    # In CHOP (ADX 20-49, which is almost always the regime on WLD 5m), price
+    # travels only 0.5-1.5×ATR to EMA21 and then reverses. A trail that arms at
+    # +3×ATR can never fire. Instead:
     #
-    # Two-phase exit:
-    #   Phase 1 (ema21_trail_active=False): price hasn't reached EMA21 yet.
-    #           Only the hard SL protects. Trail is dormant.
-    #   Phase 2 (ema21_trail_active=True):  price has crossed EMA21.
-    #           ema21_trail_stop ratchets with EMA21 each candle.
-    #           Exit when price crosses back through ema21_trail_stop.
+    #   TP  = entry ± 1.5×ATR → full close, booked immediately as a win
+    #   SL  = entry ∓ 1×ATR  (CHOP regime) → RR ≈ 1.5:1
+    #   FLIP (opposite signal) always takes priority over TP
+    #
+    # tp1_price is frozen at open; 0.0 = degraded warmup state (SL-only).
     is_exhaustion_armed:  bool  = False  # True if opened by section 1b armed logic
-    ema21_trail_active:   bool  = False  # True once price has crossed EMA21 (trail armed)
-    ema21_trail_stop:     float = 0.0    # current EMA21-based trail level (updated each candle)
+    tp1_price:            float = 0.0    # TP level (entry ± 1.5×ATR) — full close
+
+    # Legacy stubs — keep so any stale state.json fields deserialise without error
+    tp2_price:            float = 0.0
+    tp1_done:             bool  = False
+    breakeven_set:        bool  = False
+    ema21_trail_active:   bool  = False
+    ema21_trail_stop:     float = 0.0
+    partial_tp_done:      bool  = False
 
 
 # ── Main state object ──────────────────────────────────────────────────────────
