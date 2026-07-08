@@ -493,7 +493,21 @@ class ScalpingStrategy:
         _minus_di = row["minus_di"]
         _di_balanced_short = _plus_di < _minus_di * 2.0   # bears must be closing the gap
 
-        if self._short_armed and vol_ok and in_uptrend and ema_sep_ok and close > ema_slow and ema50_rising and _di_balanced_short:
+        # Bounce confirmation: require the trigger candle to close in the direction
+        # of the reversal before entering. Without this, armed signals fire on the
+        # first candle of the exhaustion move itself — price is still running hard
+        # against us (e.g. a 174M-vol dump candle closes bearish → we enter LONG).
+        # Candle-colour confirmation is only required during a deep strong-trend waterfall
+        # (DI > 45 and ADX > 50). A blanket check blocks too many valid mid-recovery entries.
+        _open                = row["open"]
+        _bearish_candle      = close < _open   # confirming candle for SHORT reversal
+        _bullish_candle      = close > _open   # confirming candle for LONG  reversal
+        _deep_bear_waterfall = _plus_di  > 45 and row["adx"] > 50  # SHORT: buyers dominating hard
+        _deep_bull_waterfall = _minus_di > 45 and row["adx"] > 50  # LONG:  sellers dominating hard
+        _short_candle_ok     = (not _deep_bear_waterfall) or _bearish_candle
+        _long_candle_ok      = (not _deep_bull_waterfall) or _bullish_candle
+
+        if self._short_armed and vol_ok and in_uptrend and ema_sep_ok and close > ema_slow and ema50_rising and _di_balanced_short and _short_candle_ok:
             _pb_dist = (close - ema_slow) / atr_val
             log.info(
                 f"SIGNAL short |  exhaustion armed  armed_remaining={self._short_armed_remaining}"
@@ -510,7 +524,7 @@ class ScalpingStrategy:
         # Block exhaustion LONG if bears are still clearly dominant (-DI >> +DI).
         _di_balanced_long = _minus_di < _plus_di * 2.0   # bulls must be closing the gap
 
-        if self._long_armed and vol_ok and in_downtrend and ema_sep_ok and close < ema_slow and ema50_falling and _di_balanced_long:
+        if self._long_armed and vol_ok and in_downtrend and ema_sep_ok and close < ema_slow and ema50_falling and _di_balanced_long and _long_candle_ok:
             _pb_dist = (ema_slow - close) / atr_val
             log.info(
                 f"SIGNAL long  |  exhaustion armed  armed_remaining={self._long_armed_remaining}"
