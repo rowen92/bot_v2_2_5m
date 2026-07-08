@@ -36,13 +36,16 @@ EMA_FAST      = 8      # fast EMA — momentum detection
 EMA_SLOW      = 21     # slow EMA — medium-term trend reference (Fib 21)
 EMA_TREND     = 50     # long-term bias — only long above, only short below
 ADX_PERIOD    = 14     # standard ADX window for 5m — balances reactivity and smoothness
-ADX_MIN       = 40.0   # minimum ADX for crossover entries (5m trends are slower; 40 is the reliable floor)
-ADX_TREND_MIN = 50.0   # higher ADX required for trend-continuation entries (50 = confirmed momentum on 5m)
+ADX_MIN       = 25.0   # minimum ADX for crossover entries — lowered to catch early-trend entries
+                       # where ADX is building (20→25→30→35) with a fresh EMA cross.
+                       # The adx_rising (slope) check is the real guard — a rising ADX at 25
+                       # with a fresh cross is a valid early entry. Requiring 40 means always
+                       # entering late after the best price is gone.
+ADX_TREND_MIN = 45.0   # higher ADX required for trend-continuation entries (lowered from 50: post-breakout ADX consolidates around 43-47 which is still valid trend)
 ADX_SLOPE_BARS = 3     # ADX must be rising over this many bars (5m is smoother; 3 bars = 15 min confirmation)
-ADX_STRONG     = 60.0  # above this level, skip ADX slope check — 5m trends that reach 60 are clearly strong; the pullback
-                       # filter (price within 1.5×ATR of EMA21) is the primary guard against exhausted
-                       # entries. Requiring rising ADX during a healthy pullback to EMA21 was blocking
-                       # valid entries: ADX naturally dips during retracements even in strong trends.
+ADX_STRONG     = 45.0  # above this level, skip ADX slope check — after a breakout ADX naturally pulls back
+                       # from its peak while trend is still intact; requiring rising ADX during a healthy
+                       # consolidation blocks all continuation entries in the 17:10-17:55 zone.
 EMA_TREND_SLOPE_BARS = 3  # EMA50 must be moving in trade direction over this many bars
 VOL_MA        = 10     # volume average window
 VOL_MULT      = 0.6    # volume must be at least 60% of average
@@ -231,11 +234,16 @@ class ScalpingStrategy:
         adx_ok       = (row["adx"] >= ADX_MIN)       and adx_rising
         adx_trend_ok = (row["adx"] >= ADX_TREND_MIN) and adx_rising
         vol_ok       = row["volume"]       >= row["vol_avg"] * VOL_MULT
-        spike_ok     = row["candle_range"] <= row["atr"] * SPIKE_ATR_MULT
+        # High-volume breakout candles are genuine momentum, not exhaustion spikes.
+        # If volume is > 3× average, relax the spike limit to SPIKE_ATR_MULT_TREND
+        # so a real institutional breakout candle is never blocked by the spike filter.
+        is_volume_breakout = row["volume"] >= row["vol_avg"] * 3.0
+        _spike_mult_cross = SPIKE_ATR_MULT_TREND if is_volume_breakout else SPIKE_ATR_MULT
+        spike_ok     = row["candle_range"] <= row["atr"] * _spike_mult_cross
         # Continuation entries in STRONG_TREND use a relaxed spike limit:
         # a large breakout candle is momentum, not exhaustion.
         regime           = self.market_regime(state)
-        _spike_mult_cont = SPIKE_ATR_MULT_TREND if regime == "STRONG_TREND" else SPIKE_ATR_MULT
+        _spike_mult_cont = SPIKE_ATR_MULT_TREND if (regime == "STRONG_TREND" or is_volume_breakout) else SPIKE_ATR_MULT
         spike_ok_cont    = row["candle_range"] <= row["atr"] * _spike_mult_cont
         cross        = row["cross"]
 
@@ -324,11 +332,13 @@ class ScalpingStrategy:
         # Covers: phantom crosses in TREND (trade #9 ema_sep=0.14×ATR),
         #         CHOP crosses with zero separation (trade #11 ema_sep=0.05×ATR),
         #         fading continuation entries (trade #5 ema_sep=0.26×ATR).
-        ema_sep_ok = abs(ema_fast - ema_trend) >= 0.5 * atr_val
-        if not ema_sep_ok:
+        _ema_sep = abs(ema_fast - ema_trend)
+        ema_sep_ok       = _ema_sep >= 0.5 * atr_val   # continuations / DI-snap / armed
+        ema_sep_ok_cross = _ema_sep >= 0.1 * atr_val   # fresh crossover — EMAs just met, naturally close
+        if not ema_sep_ok_cross:
             log.debug(
-                f"EMA SEP filtered  ema_sep={abs(ema_fast - ema_trend):.5f}"
-                f"  threshold={0.5 * atr_val:.5f}"
+                f"EMA SEP filtered  ema_sep={_ema_sep:.5f}"
+                f"  threshold={0.1 * atr_val:.5f}"
             )
 
         # EMA50 slope filter: require EMA50 to be moving in trade direction
@@ -337,7 +347,7 @@ class ScalpingStrategy:
         # as "falling" and would approve a SHORT into dead chop (e.g. DOGE T1:
         # EMA50 moved only 0.000026 over 3 bars = 0.33×ATR while visually flat).
         # Falls back to True if not enough history — don't block on warmup.
-        ema50_slope_min = row["atr"] * 0.35  # minimum meaningful EMA50 movement (DOGE-specific: 0.35×ATR — blocks flat-EMA50 entries like T1/T3 while staying above noise)
+        ema50_slope_min = row["atr"] * 0.15  # minimum meaningful EMA50 movement — low enough for slow EMA50 to clear during real trends, high enough to block near-zero noise
         if len(df) > EMA_TREND_SLOPE_BARS:
             ema_trend_prev = df["ema_trend"].iloc[-1 - EMA_TREND_SLOPE_BARS]
             ema50_delta   = ema_trend - ema_trend_prev
@@ -428,7 +438,7 @@ class ScalpingStrategy:
 
         # ── 1. Crossover entries (fresh cross signal) ─────────────────────────
         # Standard cross entries (trend-following, no exhaustion arm needed).
-        if cross == "bull" and adx_ok and vol_ok and spike_ok and in_uptrend and bias_long and ema_gap_ok_long and ema_sep_ok:
+        if cross == "bull" and adx_ok and vol_ok and spike_ok and in_uptrend and bias_long and ema_gap_ok_long and ema_sep_ok_cross:
             _pb_dist = (close - ema_slow) / atr_val
             log.info(
                 f"SIGNAL long  |  cross=bull  adx={row['adx']:.1f}  "
@@ -441,7 +451,7 @@ class ScalpingStrategy:
             self._long_armed = False   # consumed
             return "long"
 
-        if cross == "bear" and adx_ok and vol_ok and spike_ok and in_downtrend and bias_short and ema_gap_ok_short and ema_sep_ok:
+        if cross == "bear" and adx_ok and vol_ok and spike_ok and in_downtrend and bias_short and ema_gap_ok_short and ema_sep_ok_cross:
             _pb_dist = (ema_slow - close) / atr_val
             log.info(
                 f"SIGNAL short |  cross=bear  adx={row['adx']:.1f}  "
@@ -476,7 +486,14 @@ class ScalpingStrategy:
         # rising → −1.28; same pattern blocks bad LONGs during downtrends).
         # Note: ema50_rising for SHORT means the exhausted upmove had real momentum behind
         # it — EMA50 was genuinely rising before the ADX peak, making the reversal valid.
-        if self._short_armed and vol_ok and in_uptrend and ema_sep_ok and close > ema_slow and ema50_rising:
+        # Block exhaustion SHORT if bulls are still clearly dominant (+DI >> -DI).
+        # A +DI that is more than 2× -DI means the uptrend has not transferred
+        # control to sellers yet — firing a short here is premature reversal.
+        _plus_di  = row["plus_di"]
+        _minus_di = row["minus_di"]
+        _di_balanced_short = _plus_di < _minus_di * 2.0   # bears must be closing the gap
+
+        if self._short_armed and vol_ok and in_uptrend and ema_sep_ok and close > ema_slow and ema50_rising and _di_balanced_short:
             _pb_dist = (close - ema_slow) / atr_val
             log.info(
                 f"SIGNAL short |  exhaustion armed  armed_remaining={self._short_armed_remaining}"
@@ -490,7 +507,10 @@ class ScalpingStrategy:
             self._last_signal_was_di_snap = False
             return "short"
 
-        if self._long_armed and vol_ok and in_downtrend and ema_sep_ok and close < ema_slow and ema50_falling:
+        # Block exhaustion LONG if bears are still clearly dominant (-DI >> +DI).
+        _di_balanced_long = _minus_di < _plus_di * 2.0   # bulls must be closing the gap
+
+        if self._long_armed and vol_ok and in_downtrend and ema_sep_ok and close < ema_slow and ema50_falling and _di_balanced_long:
             _pb_dist = (ema_slow - close) / atr_val
             log.info(
                 f"SIGNAL long  |  exhaustion armed  armed_remaining={self._long_armed_remaining}"
@@ -537,6 +557,7 @@ class ScalpingStrategy:
         # ema50_falling required: confirms the dominant downmove was real and is now
         # exhausting — prevents firing LONG snap entries during uptrends where -DI
         # briefly spikes on a pullback (T2, T4, T11, T14, T15, T16 patterns).
+        # _di_balanced_long: -DI must be < 2× +DI — bulls must be showing up.
         if (
             _minus_di_n3 >= _DI_EXTREMITY   # peak was extreme
             and _minus_di_snapped            # 2-bar confirmed snap down
@@ -544,8 +565,9 @@ class ScalpingStrategy:
             and _adx_floor_ok
             and vol_ok
             and ema50_falling               # EMA50 must confirm dominant downtrend
+            and _di_balanced_long           # bulls must be showing up, not near-zero
         ):
-            _snap_sl = close - 0.5 * atr_val        # ATR-based SL: gives breathing room below entry
+            _snap_sl = close - 1.0 * atr_val        # 1×ATR: wider room to absorb sweeps without being stopped
             _snap_tp = float(ema_slow)              # EMA21 = mean-reversion target
             log.info(
                 f"SIGNAL long  |  DI-snap exhaustion"
@@ -567,6 +589,9 @@ class ScalpingStrategy:
         # ema50_rising required: confirms the dominant upmove was real and is now
         # exhausting — prevents firing SHORT snap entries during downtrends where +DI
         # briefly spikes on a dead-cat bounce (T18, T19, T20 patterns).
+        # _di_balanced_short: +DI must be < 2× -DI — if bears have near-zero presence
+        # the uptrend is still fully in control and the snap is premature (e.g. 22:15
+        # trade: +DI=36, -DI=6 → blocked, trend still accelerating to ADX=61).
         if (
             _plus_di_n3 >= _DI_EXTREMITY    # peak was extreme
             and _plus_di_snapped             # 2-bar confirmed snap down
@@ -574,8 +599,9 @@ class ScalpingStrategy:
             and _adx_floor_ok
             and vol_ok
             and ema50_rising                # EMA50 must confirm dominant uptrend
+            and _di_balanced_short          # bears must be showing up, not near-zero
         ):
-            _snap_sl = close + 0.5 * atr_val        # ATR-based SL: gives breathing room above entry
+            _snap_sl = close + 1.0 * atr_val        # 1×ATR: wider room to absorb sweeps without being stopped
             _snap_tp = float(ema_slow)              # EMA21 = mean-reversion target
             log.info(
                 f"SIGNAL short |  DI-snap exhaustion"

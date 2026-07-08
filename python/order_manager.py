@@ -177,8 +177,15 @@ class OrderManager:
         client: Optional[AsyncClient] = None,
     ) -> None:
         """Check if TP or SL has been touched; close if so.
-        Called on every price tick. All exit types (flat TP, trail, hard SL)
-        are checked here — no candle-close variant needed.
+        Called on every price tick.
+
+        TP  — fires immediately on any tick (grab profit as soon as it's there).
+        SL  — fires only when the last 5m candle CLOSED beyond the SL level.
+               A wick that spikes through SL and recovers within the same candle
+               is a liquidity sweep, not a real break. Requiring a candle close
+               means the market has to sustain the move for a full 5 minutes
+               before we accept the loss — wicks cannot trigger it.
+               last_candle_close is updated by ws_client on every candle close.
         """
         pos = state.position
         if pos is None:
@@ -193,37 +200,38 @@ class OrderManager:
         if price <= 0:
             return
 
+        # Candle-close price used for ALL SL decisions (0.0 = no candle closed yet)
+        candle_close = state.last_candle_close
+
         hit = None
 
         if pos.is_di_snap:
-            # ── DI-snap exits: fixed TP at EMA21, hard SL at candle high/low ──
+            # ── DI-snap exits: fixed TP at EMA21, candle-close SL ────────────
             if pos.side == "long":
                 if price >= pos.di_snap_tp:
                     hit = "tp"
-                elif price <= pos.sl_price:
+                elif candle_close > 0 and candle_close <= pos.sl_price:
                     hit = "sl"
             else:  # short
                 if price <= pos.di_snap_tp:
                     hit = "tp"
-                elif price >= pos.sl_price:
+                elif candle_close > 0 and candle_close >= pos.sl_price:
                     hit = "sl"
 
         elif pos.is_exhaustion_armed:
-            # ── Exhaustion-armed (1b): flat TP1/TP2 exit — no trail ──────────
-            # In CHOP (ADX 20-49, almost always on WLD 5m), price travels
+            # ── Exhaustion-armed (1b): flat TP exit, candle-close SL ─────────
             # Single flat TP at +1.5×ATR — full close, booked immediately.
             # FLIP (opposite signal) takes priority and is handled before this block.
             # tp1_price is set at open; 0.0 means no TP (degraded warmup state → SL only).
-
             if pos.side == "long":
                 if pos.tp1_price > 0 and price >= pos.tp1_price:
                     hit = "tp"
-                elif price <= pos.sl_price:
+                elif candle_close > 0 and candle_close <= pos.sl_price:
                     hit = "sl"
             else:  # short
                 if pos.tp1_price > 0 and price <= pos.tp1_price:
                     hit = "tp"
-                elif price >= pos.sl_price:
+                elif candle_close > 0 and candle_close >= pos.sl_price:
                     hit = "sl"
 
         else:
@@ -231,13 +239,13 @@ class OrderManager:
             if rm.update_trail(pos, price, live_atr=state.live_atr):
                 hit = "trail_tp"
 
-            # ── Hard SL (fires immediately — real loss protection) ────────────
+            # ── SL: only on candle close, not on a wick ───────────────────────
             if hit is None:
                 if pos.side == "long":
-                    if price <= pos.sl_price:
+                    if candle_close > 0 and candle_close <= pos.sl_price:
                         hit = "sl"
                 else:  # short
-                    if price >= pos.sl_price:
+                    if candle_close > 0 and candle_close >= pos.sl_price:
                         hit = "sl"
 
         if hit:
