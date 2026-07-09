@@ -31,26 +31,26 @@ class RiskManager:
         """
         Cooldown scaled by last close reason and consecutive SL streak.
 
-        After TP  → base cooldown (COOLDOWN_CANDLES)
+        After TP  → base cooldown (COOLDOWN_CANDLES × 300s)
         After SL  → 2× base cooldown  (market rejected us, wait longer)
-        After 2+ consecutive SLs → 4× base cooldown  (market is fighting us hard)
+        After 2+ consecutive SLs → 3× base cooldown  (market is fighting us hard)
 
-        All values in seconds (assumes 1m candles: 1 candle = 60s).
+        All values in seconds. 1 candle = 300s on 5m timeframe.
         """
-        base = cfg.COOLDOWN_CANDLES * 60
+        base = cfg.COOLDOWN_CANDLES * 300  # 5m candles: 1 candle = 300 seconds
         reason = getattr(state, "last_close_reason", "")
         streak = getattr(state, "consecutive_sl", 0)
 
         if streak >= 2:
-            cooldown = base * 2   # was 4× — too aggressive, was blocking valid signals
+            cooldown = base * 3   # 2+ consecutive SLs → 3 candles (15 min)
         elif reason == "sl":
-            cooldown = base * 2
+            cooldown = base * 2   # single SL → 2 candles (10 min)
         else:
-            cooldown = base
+            cooldown = base       # TP / trail_tp → 1 candle (5 min)
 
-        # Hard cap: never wait more than 120s regardless of streak.
-        # On fast-moving 1m markets a 240s block misses entire trend legs.
-        cooldown = min(cooldown, 120)
+        # Hard cap: 4 candles (20 min) — streak penalty is meaningful but
+        # won't block a full trend leg on a 5m chart.
+        cooldown = min(cooldown, base * 4)
 
         if cooldown != base:
             log.debug(

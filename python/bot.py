@@ -93,11 +93,26 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
                 )
                 is_flip = False
             else:
-                log.info(
-                    f"FLIP detected — closing {pos.side.upper()} to open {signal.upper()}"
-                    f"{'  [exhaustion reversal]' if is_exhaustion_flip else ''}"
-                )
-                await orders.close_position("FLIP", state, client)
+                # Price-movement guard: only flip if price has moved at least
+                # 0.5×ATR from entry. Flipping at entry price just burns fees
+                # with no directional edge (e.g. trade #6: LONG opened at 0.0723,
+                # FLIPped at 0.0723 = -0.55 USDT in fees only).
+                atr_now    = indicators.get("atr") or 0.0
+                price_move = abs(state.mark_price - pos.entry_price)
+                min_move   = atr_now * 0.5
+                if not is_exhaustion_flip and atr_now > 0 and price_move < min_move:
+                    log.info(
+                        f"FLIP suppressed — price move too small  "
+                        f"move={price_move:.6f}  min={min_move:.6f} (0.5×ATR)  "
+                        f"entry={pos.entry_price:.6f}  price={state.mark_price:.6f}"
+                    )
+                    is_flip = False
+                else:
+                    log.info(
+                        f"FLIP detected — closing {pos.side.upper()} to open {signal.upper()}"
+                        f"{'  [exhaustion reversal]' if is_exhaustion_flip else ''}"
+                    )
+                    await orders.close_position("FLIP", state, client)
 
         # CHOP block: skip new entries (not flips) when market regime is CHOP.
         # ADX < 45 = no real momentum — entries in this regime have no edge on WLD.
