@@ -72,6 +72,12 @@ class Config:
     # Set CHOP_BLOCK=false in .env to re-enable per-bot if needed.
     CHOP_BLOCK: bool = os.getenv('CHOP_BLOCK', 'true').lower() == 'true'
 
+    # Minimum price movement (as ATR multiple) required before a FLIP is allowed.
+    # FLIP is suppressed if abs(mark_price - entry) < FLIP_MIN_MOVE_ATR × ATR.
+    # Default 0.3 — safe for most assets (WLD genuine reversals move ~0.4×ATR)
+    # DOGE overrides to 0.5 in .env — tighter filter needed for low-volatility oscillation
+    FLIP_MIN_MOVE_ATR: float = _float('FLIP_MIN_MOVE_ATR', 0.3)
+
     # ── Fixed-% fallback (used only when ATR is unavailable) ──────────────────
     TAKE_PROFIT_PCT: float = _float("TAKE_PROFIT_PCT", 0.40)  # unused at runtime
     STOP_LOSS_PCT:   float = _float("STOP_LOSS_PCT",   0.20)

@@ -99,7 +99,7 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
                 # FLIPped at 0.0723 = -0.55 USDT in fees only).
                 atr_now    = indicators.get("atr") or 0.0
                 price_move = abs(state.mark_price - pos.entry_price)
-                min_move   = atr_now * 0.5
+                min_move   = atr_now * cfg.FLIP_MIN_MOVE_ATR
                 if not is_exhaustion_flip and atr_now > 0 and price_move < min_move:
                     log.info(
                         f"FLIP suppressed — price move too small  "
