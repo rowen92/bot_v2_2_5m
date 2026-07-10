@@ -582,7 +582,7 @@ class ScalpingStrategy:
             and _di_balanced_long           # bulls must be showing up, not near-zero
         ):
             _snap_sl = close - 1.0 * atr_val        # 1×ATR: wider room to absorb sweeps without being stopped
-            _snap_tp = float(ema_slow)              # EMA21 = mean-reversion target
+            _snap_tp = max(float(ema_slow), close + 1.5 * atr_val)  # min 1.5:1 R:R floor
             log.info(
                 f"SIGNAL long  |  DI-snap exhaustion"
                 f"  -DI={_minus_di_n3:.1f}→{_minus_di_n2:.1f}→{_minus_di_n1:.1f}"
@@ -616,7 +616,7 @@ class ScalpingStrategy:
             and _di_balanced_short          # bears must be showing up, not near-zero
         ):
             _snap_sl = close + 1.0 * atr_val        # 1×ATR: wider room to absorb sweeps without being stopped
-            _snap_tp = float(ema_slow)              # EMA21 = mean-reversion target
+            _snap_tp = min(float(ema_slow), close - 1.5 * atr_val)  # min 1.5:1 R:R floor
             log.info(
                 f"SIGNAL short |  DI-snap exhaustion"
                 f"  +DI={_plus_di_n3:.1f}→{_plus_di_n2:.1f}→{_plus_di_n1:.1f}"
