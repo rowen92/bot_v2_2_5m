@@ -71,12 +71,15 @@ class OrderManager:
             is_exhaustion_armed_check = strategy is not None and strategy.was_exhaustion_reversal() and not is_di_snap
             if is_exhaustion_armed_check and atr:
                 # Cap SL at 1.5×ATR for exhaustion reversals — regime SL (2.5–3×ATR in
-                # TREND/STRONG_TREND) gave 0.6:1 R:R vs 1.5×ATR TP, bleeding even good setups.
+                # TREND/STRONG_TREND) gave 0.6:1 R:R vs TP, bleeding even good setups.
+                # TP raised to 2.0×ATR (from 1.5): gives 1.33:1 R:R; avg win was only
+                # +0.65 USDT at 1.5×ATR vs avg loss −1.1 USDT — fees eroded symmetric setups.
                 dist = atr * 1.5
                 sl = entry + dist if signal == "short" else entry - dist
+                tp = entry - atr * 2.0 if signal == "short" else entry + atr * 2.0
             else:
                 sl = rm.sl_price(entry, signal, atr=atr, regime=regime)
-            tp = sl  # no fixed TP — trail at +2R is the only exit; tp field kept for dataclass compat
+                tp = sl  # no fixed TP — trail at +2R is the only exit; tp field kept for dataclass compat
             log.info(
                 f"open_position  regime={regime}  signal={signal}  "
                 f"entry={entry:.4f}  sl={sl:.4f}  qty={qty}"

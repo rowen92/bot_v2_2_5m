@@ -47,7 +47,10 @@ ADX_MIN       = 25.0   # minimum ADX for crossover entries — lowered to catch 
                        # The adx_rising (slope) check is the real guard — a rising ADX at 25
                        # with a fresh cross is a valid early entry. Requiring 40 means always
                        # entering late after the best price is gone.
-ADX_TREND_MIN = 45.0   # higher ADX required for trend-continuation entries (lowered from 50: post-breakout ADX consolidates around 43-47 which is still valid trend)
+ADX_TREND_MIN = 50.0   # continuation entries only in STRONG_TREND (ADX >= 50);
+                       # 30-day analysis: TREND regime continuations (ADX 45–49) are net −10.55,
+                       # STRONG_TREND continuations are +11.03 — the ADX 45-49 boundary entries
+                       # are in mature/reversing trends, not fresh momentum
 ADX_SLOPE_BARS = 3     # ADX must be rising over this many bars (5m is smoother; 3 bars = 15 min confirmation)
 ADX_STRONG     = 45.0  # above this level, skip ADX slope check — after a breakout ADX naturally pulls back
                        # from its peak while trend is still intact; requiring rising ADX during a healthy
@@ -151,6 +154,7 @@ class ScalpingStrategy:
             "plus_di":   round(row["plus_di"],   2),
             "minus_di":  round(row["minus_di"],  2),
             "atr":       round(row["atr"],       cfg.PRICE_PRECISION + 1),
+            "ker":       round(row["ker"],       3),
             "volume":    round(row["volume"],    2),
             "vol_avg":   round(row["vol_avg"],   2),
             "cross":     row["cross"],   # 'bull' | 'bear' | 'none'
@@ -448,7 +452,13 @@ class ScalpingStrategy:
         # NOT applied to exhaustion/di_snap entries: those fade a high-KER trend.
         ker_ok = row["ker"] >= KER_MIN_CROSS
 
-        if cross == "bull" and adx_ok and vol_ok and spike_ok and in_uptrend and bias_long and ema_gap_ok_long and ema_sep_ok_cross and ker_ok:
+        # Cross and continuation entries are blocked in CHOP regime:
+        # 30-day analysis shows CHOP cross WR ~36% (−8.43 total) — EMAs crossing in a
+        # range are noise, not momentum. Only exhaustion_armed is allowed in CHOP
+        # (fades extremes with fixed TP, structurally suited to mean-reversion).
+        _in_chop = (regime == "CHOP")
+
+        if cross == "bull" and adx_ok and vol_ok and spike_ok and in_uptrend and bias_long and ema_gap_ok_long and ema_sep_ok_cross and ker_ok and not _in_chop:
             _pb_dist = (close - ema_slow) / atr_val
             log.info(
                 f"SIGNAL long  |  cross=bull  adx={row['adx']:.1f}  "
@@ -461,7 +471,7 @@ class ScalpingStrategy:
             self._long_armed = False   # consumed
             return "long"
 
-        if cross == "bear" and adx_ok and vol_ok and spike_ok and in_downtrend and bias_short and ema_gap_ok_short and ema_sep_ok_cross and ker_ok:
+        if cross == "bear" and adx_ok and vol_ok and spike_ok and in_downtrend and bias_short and ema_gap_ok_short and ema_sep_ok_cross and ker_ok and not _in_chop:
             _pb_dist = (ema_slow - close) / atr_val
             log.info(
                 f"SIGNAL short |  cross=bear  adx={row['adx']:.1f}  "
@@ -496,12 +506,13 @@ class ScalpingStrategy:
         # rising → −1.28; same pattern blocks bad LONGs during downtrends).
         # Note: ema50_rising for SHORT means the exhausted upmove had real momentum behind
         # it — EMA50 was genuinely rising before the ADX peak, making the reversal valid.
-        # Bears must lead by at least 3 pts before we short.
+        # Bears must lead by at least 8 pts before we short (raised from 3).
         # Gap=0 allowed razor-thin setups that lost immediately (e.g. gap=0.85, gap=5.29).
-        # 3 pt minimum ensures bears have a real edge, not just noise.
+        # 30-day analysis: losses cluster at DI gaps 3–6 (trades #1,4,13,14,26,27 all SL).
+        # 8 pt minimum filters those noise setups while keeping wins with gaps ≥8.
         _plus_di  = row["plus_di"]
         _minus_di = row["minus_di"]
-        _DI_MIN_LEAD = 3.0
+        _DI_MIN_LEAD = 8.0
         _di_balanced_short = (_minus_di - _plus_di) >= _DI_MIN_LEAD   # bears lead by margin
 
         # Bounce confirmation: require the trigger candle to close in the direction
@@ -522,8 +533,14 @@ class ScalpingStrategy:
         # Also require the reversing DI to be rising (gaining momentum) over last 2 bars —
         # if bears/bulls aren't actually growing, the reversal has no force behind it.
         _armed_adx_ok      = row["adx"] >= 25.0
-        _armed_short_di_ok = (_plus_di - _minus_di) <= 20.0
-        _armed_long_di_ok  = (_minus_di - _plus_di) <= 20.0
+        # SHORT exhaustion fades an up-move: dominant DI is minus_di (bears just took over).
+        # Block if minus_di still dominates by > 20 — reversal has no room yet.
+        # Previously checked (_plus_di - _minus_di) <= 20 which always passed when minus_di
+        # was dominant (e.g. plus=9.51, minus=65.76 → -56.3 <= 20 ✓ — bug).
+        _armed_short_di_ok = (_minus_di - _plus_di) <= 20.0
+        # LONG exhaustion fades a down-move: dominant DI is plus_di (bulls just took over).
+        # Block if plus_di still dominates by > 20.
+        _armed_long_di_ok  = (_plus_di - _minus_di) <= 20.0
         # Reversing DI momentum: require the counter-DI to be rising over last 2 bars
         _minus_di_prev2 = df["minus_di"].iloc[-3] if len(df) >= 3 else _minus_di
         _plus_di_prev2  = df["plus_di"].iloc[-3]  if len(df) >= 3 else _plus_di
@@ -719,8 +736,9 @@ class ScalpingStrategy:
         #
         # Needs 4 ADX values: peak bar [-3], one bar before [-4], two falls [-2],[-1]
         _EXHAUSTION_ARM_WINDOW = 15   # candles the arm stays active waiting for cross
-        _EXHAUSTION_ADX_FLOOR  = 20   # minimum adx_peak to arm — on 5m ADX peaks slower/lower;
-                                      # 20 still filters pure noise while catching real exhaustion moves
+        _EXHAUSTION_ADX_FLOOR  = 35   # minimum adx_peak to arm — raised from 20 to 35;
+                                      # 30-day analysis showed CHOP exhaustion arms cluster at ADX 25–34
+                                      # and are net losers; TREND/STRONG_TREND peaks are ADX 36+
 
         if len(df) >= 4:
             _adx_n4 = df["adx"].iloc[-4]
