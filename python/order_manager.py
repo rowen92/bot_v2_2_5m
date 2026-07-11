@@ -68,7 +68,14 @@ class OrderManager:
                 f"  entry={entry:.4f}  sl={sl:.4f}  tp={tp:.4f}  qty={qty}"
             )
         else:
-            sl = rm.sl_price(entry, signal, atr=atr, regime=regime)
+            is_exhaustion_armed_check = strategy is not None and strategy.was_exhaustion_reversal() and not is_di_snap
+            if is_exhaustion_armed_check and atr:
+                # Cap SL at 1.5×ATR for exhaustion reversals — regime SL (2.5–3×ATR in
+                # TREND/STRONG_TREND) gave 0.6:1 R:R vs 1.5×ATR TP, bleeding even good setups.
+                dist = atr * 1.5
+                sl = entry + dist if signal == "short" else entry - dist
+            else:
+                sl = rm.sl_price(entry, signal, atr=atr, regime=regime)
             tp = sl  # no fixed TP — trail at +2R is the only exit; tp field kept for dataclass compat
             log.info(
                 f"open_position  regime={regime}  signal={signal}  "
@@ -92,9 +99,10 @@ class OrderManager:
             pos.ema21_trail_stop    = 0.0
 
             # Flat single TP for exhaustion-armed entries — frozen at open.
-            # TP = entry ± 1.5×ATR  → full close, booked immediately as a win.
-            # FLIP still takes priority if an opposite signal fires first.
-            # SL is ~1×ATR away (CHOP regime) → RR ≈ 1.5:1
+            # TP = entry ± 1.5×ATR  → full close, booked as a win.
+            # DI filter (minus_di >= plus_di for SHORT, plus_di >= minus_di for LONG)
+            # now blocks the bad entries that made 1.5×ATR unprofitable before.
+            # 2.5×ATR TP was too far: TREND SL=2.5×ATR → 1:1 R:R, STRONG → 0.6:1 R:R.
             if is_exhaustion_armed and atr:
                 if signal == "long":
                     pos.tp1_price = entry + 1.5 * atr

@@ -32,6 +32,12 @@ from state import State
 log = logging.getLogger("strategy")
 
 # ── Tuneable parameters ───────────────────────────────────────────────────────
+KER_PERIOD        = 10    # Kaufman Efficiency Ratio period
+KER_MIN_CROSS     = 0.35  # EMA cross entries require this minimum efficiency (filters choppy crosses)
+                          # Lowered from 0.45: 0.45 blocked too many winning cross entries
+                          # NOT applied to exhaustion/armed entries — KER is high during trends we're fading
+KER_MIN_CONT      = 0.30  # Continuation entries: lower bar — trend must exist but can be slower
+
 EMA_FAST      = 8      # fast EMA — momentum detection
 EMA_SLOW      = 21     # slow EMA — medium-term trend reference (Fib 21)
 EMA_TREND     = 50     # long-term bias — only long above, only short below
@@ -438,7 +444,11 @@ class ScalpingStrategy:
 
         # ── 1. Crossover entries (fresh cross signal) ─────────────────────────
         # Standard cross entries (trend-following, no exhaustion arm needed).
-        if cross == "bull" and adx_ok and vol_ok and spike_ok and in_uptrend and bias_long and ema_gap_ok_long and ema_sep_ok_cross:
+        # KER filters choppy crosses — if price is churning, the cross is noise.
+        # NOT applied to exhaustion/di_snap entries: those fade a high-KER trend.
+        ker_ok = row["ker"] >= KER_MIN_CROSS
+
+        if cross == "bull" and adx_ok and vol_ok and spike_ok and in_uptrend and bias_long and ema_gap_ok_long and ema_sep_ok_cross and ker_ok:
             _pb_dist = (close - ema_slow) / atr_val
             log.info(
                 f"SIGNAL long  |  cross=bull  adx={row['adx']:.1f}  "
@@ -451,7 +461,7 @@ class ScalpingStrategy:
             self._long_armed = False   # consumed
             return "long"
 
-        if cross == "bear" and adx_ok and vol_ok and spike_ok and in_downtrend and bias_short and ema_gap_ok_short and ema_sep_ok_cross:
+        if cross == "bear" and adx_ok and vol_ok and spike_ok and in_downtrend and bias_short and ema_gap_ok_short and ema_sep_ok_cross and ker_ok:
             _pb_dist = (ema_slow - close) / atr_val
             log.info(
                 f"SIGNAL short |  cross=bear  adx={row['adx']:.1f}  "
@@ -486,12 +496,13 @@ class ScalpingStrategy:
         # rising → −1.28; same pattern blocks bad LONGs during downtrends).
         # Note: ema50_rising for SHORT means the exhausted upmove had real momentum behind
         # it — EMA50 was genuinely rising before the ADX peak, making the reversal valid.
-        # Block exhaustion SHORT if bulls are still clearly dominant (+DI >> -DI).
-        # A +DI that is more than 2× -DI means the uptrend has not transferred
-        # control to sellers yet — firing a short here is premature reversal.
+        # Bears must lead by at least 3 pts before we short.
+        # Gap=0 allowed razor-thin setups that lost immediately (e.g. gap=0.85, gap=5.29).
+        # 3 pt minimum ensures bears have a real edge, not just noise.
         _plus_di  = row["plus_di"]
         _minus_di = row["minus_di"]
-        _di_balanced_short = _plus_di < _minus_di * 2.0   # bears must be closing the gap
+        _DI_MIN_LEAD = 3.0
+        _di_balanced_short = (_minus_di - _plus_di) >= _DI_MIN_LEAD   # bears lead by margin
 
         # Bounce confirmation: require the trigger candle to close in the direction
         # of the reversal before entering. Without this, armed signals fire on the
@@ -507,7 +518,19 @@ class ScalpingStrategy:
         _short_candle_ok     = (not _deep_bear_waterfall) or _bearish_candle
         _long_candle_ok      = (not _deep_bull_waterfall) or _bullish_candle
 
-        if self._short_armed and vol_ok and in_uptrend and ema_sep_ok and close > ema_slow and ema50_rising and _di_balanced_short and _short_candle_ok:
+        # XRP: block armed entries when ADX < 25 or dominant DI still leads by > 20pts.
+        # Also require the reversing DI to be rising (gaining momentum) over last 2 bars —
+        # if bears/bulls aren't actually growing, the reversal has no force behind it.
+        _armed_adx_ok      = row["adx"] >= 25.0
+        _armed_short_di_ok = (_plus_di - _minus_di) <= 20.0
+        _armed_long_di_ok  = (_minus_di - _plus_di) <= 20.0
+        # Reversing DI momentum: require the counter-DI to be rising over last 2 bars
+        _minus_di_prev2 = df["minus_di"].iloc[-3] if len(df) >= 3 else _minus_di
+        _plus_di_prev2  = df["plus_di"].iloc[-3]  if len(df) >= 3 else _plus_di
+        _bears_rising   = _minus_di > _minus_di_prev2   # -DI growing = bears gaining
+        _bulls_rising   = _plus_di  > _plus_di_prev2    # +DI growing = bulls gaining
+
+        if self._short_armed and vol_ok and in_uptrend and ema_sep_ok and close > ema_slow and ema50_rising and _di_balanced_short and _short_candle_ok and _armed_adx_ok and _armed_short_di_ok and _bears_rising:
             _pb_dist = (close - ema_slow) / atr_val
             log.info(
                 f"SIGNAL short |  exhaustion armed  armed_remaining={self._short_armed_remaining}"
@@ -521,10 +544,11 @@ class ScalpingStrategy:
             self._last_signal_was_di_snap = False
             return "short"
 
-        # Block exhaustion LONG if bears are still clearly dominant (-DI >> +DI).
-        _di_balanced_long = _minus_di < _plus_di * 2.0   # bulls must be closing the gap
+        # Bulls must lead by at least 3 pts before we long — same margin as short filter.
+        # Blocks gap=0.85 and gap=5.29 losing setups where DI crossover wasn't confirmed.
+        _di_balanced_long = (_plus_di - _minus_di) >= _DI_MIN_LEAD    # bulls lead by margin
 
-        if self._long_armed and vol_ok and in_downtrend and ema_sep_ok and close < ema_slow and ema50_falling and _di_balanced_long and _long_candle_ok:
+        if self._long_armed and vol_ok and in_downtrend and ema_sep_ok and close < ema_slow and ema50_falling and _di_balanced_long and _long_candle_ok and _armed_adx_ok and _armed_long_di_ok and _bulls_rising:
             _pb_dist = (ema_slow - close) / atr_val
             log.info(
                 f"SIGNAL long  |  exhaustion armed  armed_remaining={self._long_armed_remaining}"
@@ -549,8 +573,10 @@ class ScalpingStrategy:
         # No EMA50 filter: these are mean-reversion snaps — EMA50 lags the reversal.
         # No spike filter: an outsized candle IS the exhaustion we're trading against.
         # TP target is EMA21 (handled by order_manager/risk_manager).
-        _DI_EXTREMITY  = 35.0   # DI must reach this level to qualify as a true extreme
-        _DI_ADX_FLOOR  = 20.0   # ADX floor — avoids firing during pure flat/ranging noise
+        # XRP-tuned: 35→40 filters noise snaps (bad trades had peak DI 25–26, not extreme).
+        # 20→25 matches ADX_MIN — no di_snap entries in CHOP.
+        _DI_EXTREMITY  = 40.0
+        _DI_ADX_FLOOR  = 25.0
 
         if len(df) >= 3:
             _plus_di_n3  = df["plus_di"].iloc[-3]
@@ -573,7 +599,7 @@ class ScalpingStrategy:
         # briefly spikes on a pullback (T2, T4, T11, T14, T15, T16 patterns).
         # _di_balanced_long: -DI must be < 2× +DI — bulls must be showing up.
         if (
-            _minus_di_n3 >= _DI_EXTREMITY   # peak was extreme
+            _minus_di_n3 >= _DI_EXTREMITY   # peak was extreme (≥40 for XRP)
             and _minus_di_snapped            # 2-bar confirmed snap down
             and close < ema_slow            # price stretched below EMA21
             and _adx_floor_ok
@@ -607,7 +633,7 @@ class ScalpingStrategy:
         # the uptrend is still fully in control and the snap is premature (e.g. 22:15
         # trade: +DI=36, -DI=6 → blocked, trend still accelerating to ADX=61).
         if (
-            _plus_di_n3 >= _DI_EXTREMITY    # peak was extreme
+            _plus_di_n3 >= _DI_EXTREMITY    # peak was extreme (≥40 for XRP)
             and _plus_di_snapped             # 2-bar confirmed snap down
             and close > ema_slow            # price stretched above EMA21
             and _adx_floor_ok
@@ -637,7 +663,15 @@ class ScalpingStrategy:
         # Re-enters after SL+cooldown when trend is still strongly intact.
         # Requires ADX >= 50 (vs 40 for crossover) to avoid choppy re-entries.
         # EMA50 bias still enforced — never trade against long-term trend.
-        if in_uptrend and adx_trend_ok and vol_ok and spike_ok_cont and bias_long and ema_gap_ok_long and ema_sep_ok and ema50_rising:
+        ker_ok_cont = row["ker"] >= KER_MIN_CONT
+        # XRP continuation filter: require dominant DI to lead by ≥15 pts.
+        # Losing continuation LONGs had plus_di leads of 9–14 pts — barely trending.
+        # 15 pt minimum ensures the trend has real directional strength, not just noise.
+        _CONT_DI_MIN_LEAD = 15.0
+        _cont_long_ok  = (_plus_di - _minus_di) >= _CONT_DI_MIN_LEAD
+        _cont_short_ok = (_minus_di - _plus_di) >= _CONT_DI_MIN_LEAD
+
+        if in_uptrend and adx_trend_ok and vol_ok and spike_ok_cont and bias_long and ema_gap_ok_long and ema_sep_ok and ema50_rising and ker_ok_cont and _cont_long_ok:
             if _pump_extended:
                 log.debug(
                     f"CUMULATIVE MOVE filtered (long)  net={_net_move:.5f}  limit={_atr_limit:.5f}"
@@ -654,7 +688,7 @@ class ScalpingStrategy:
                 self._last_signal_was_di_snap = False
                 return "long"
 
-        if in_downtrend and adx_trend_ok and vol_ok and spike_ok_cont and bias_short and ema_gap_ok_short and ema_sep_ok and ema50_falling:
+        if in_downtrend and adx_trend_ok and vol_ok and spike_ok_cont and bias_short and ema_gap_ok_short and ema_sep_ok and ema50_falling and ker_ok_cont and _cont_short_ok:
             if _dump_extended:
                 log.debug(
                     f"CUMULATIVE MOVE filtered (short)  net={_net_move:.5f}  limit={-_atr_limit:.5f}"
@@ -817,6 +851,18 @@ def _adx(df: pd.DataFrame, period: int) -> tuple[pd.Series, pd.Series, pd.Series
     return adx, plus_di.fillna(0), minus_di.fillna(0)
 
 
+def _ker(df: pd.DataFrame, period: int) -> pd.Series:
+    """Kaufman Efficiency Ratio: net directional move / sum of absolute candle moves.
+    Range [0, 1]. Near 1 = price moving in a straight line (efficient trend).
+    Near 0 = price churning sideways (noise/chop). NaN-safe: fills with 0.0.
+    Applied only to cross/continuation entries — NOT to exhaustion reversals,
+    where a high KER means the trend we're fading is still running hard.
+    """
+    direction  = (df["close"] - df["close"].shift(period)).abs()
+    volatility = (df["close"] - df["close"].shift(1)).abs().rolling(period).sum()
+    return (direction / volatility.replace(0, float("nan"))).fillna(0.0)
+
+
 def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -827,6 +873,7 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["adx"], df["plus_di"], df["minus_di"] = _adx(df, ADX_PERIOD)
     df["vol_avg"]      = df["volume"].rolling(VOL_MA, min_periods=1).median()
     df["candle_range"] = df["high"] - df["low"]
+    df["ker"]          = _ker(df, KER_PERIOD)
 
     prev_fast = df["ema_fast"].shift(1)
     prev_slow = df["ema_slow"].shift(1)
