@@ -29,70 +29,18 @@ class RiskManager:
 
     def _dynamic_cooldown_seconds(self, state: State) -> int:
         """
-        Cooldown scaled by last close reason and consecutive SL streak.
-
-        After TP  → base cooldown (COOLDOWN_CANDLES × 300s)
-        After SL  → 2× base cooldown  (market rejected us, wait longer)
-        After 2+ consecutive SLs → 3× base cooldown  (market is fighting us hard)
-
-        All values in seconds. 1 candle = 300s on 5m timeframe.
+        Flat cooldown of COOLDOWN_CANDLES × 300s after every close.
+        Mirrors backtest.py COOLDOWN_CANDLES = 1 (one 5m candle = 300s).
+        Streak pausing is handled separately by the consecutive-SL circuit
+        breaker in can_trade() — no need to also scale cooldown here.
         """
-        base = cfg.COOLDOWN_CANDLES * 300  # 5m candles: 1 candle = 300 seconds
-        reason = getattr(state, "last_close_reason", "")
-        streak = getattr(state, "consecutive_sl", 0)
-
-        if streak >= 2:
-            cooldown = base * 3   # 2+ consecutive SLs → 3 candles (15 min)
-        elif reason == "sl":
-            cooldown = base * 2   # single SL → 2 candles (10 min)
-        else:
-            cooldown = base       # TP / trail_tp → 1 candle (5 min)
-
-        # Hard cap: 4 candles (20 min) — streak penalty is meaningful but
-        # won't block a full trend leg on a 5m chart.
-        cooldown = min(cooldown, base * 4)
-
-        if cooldown != base:
-            log.debug(
-                f"dynamic_cooldown={cooldown}s  reason={reason}  consecutive_sl={streak}"
-            )
-        return cooldown
+        return cfg.COOLDOWN_CANDLES * 300
 
     def _dynamic_risk_pct(self, state: State) -> float:
+        """Flat risk — full RISK_PER_TRADE_PCT every trade, no streak/drawdown scaling.
+        Mirrors backtest.py calc_qty() which uses RISK_PCT directly.
         """
-        Scale RISK_PER_TRADE_PCT down linearly as daily loss grows.
-
-        At 0% daily loss  → full base risk (RISK_PER_TRADE_PCT)
-        At MAX_DAILY_LOSS → 0% risk (no trade would pass anyway, but sizing is 0)
-
-        Also applies a consecutive-SL penalty: each SL in a row cuts risk by 20%
-        (capped at 60% reduction) so a losing streak doesn't blow up the account.
-
-        Examples (base=1%, max_loss=3%):
-          daily_loss=0%,  streak=0 → 1.00%
-          daily_loss=1.5%, streak=0 → 0.50%
-          daily_loss=0%,  streak=2 → 0.60%
-          daily_loss=1.5%, streak=2 → 0.30%
-        """
-        base = cfg.RISK_PER_TRADE_PCT
-        daily_loss = abs(min(state.daily_loss_pct(), 0.0))   # 0 if positive day
-        max_loss   = cfg.MAX_DAILY_LOSS_PCT
-
-        # Linear scale: 1.0 at 0% loss, 0.0 at MAX_DAILY_LOSS
-        daily_factor = max(0.0, 1.0 - (daily_loss / max_loss))
-
-        # Consecutive SL penalty: -20% per SL, max -60%
-        streak = getattr(state, "consecutive_sl", 0)
-        streak_factor = max(0.4, 1.0 - (streak * 0.20))
-
-        dynamic = base * daily_factor * streak_factor
-
-        if dynamic < base:
-            log.debug(
-                f"dynamic_risk={dynamic:.3f}%  base={base}%  "
-                f"daily_loss={daily_loss:.2f}%  consecutive_sl={streak}"
-            )
-        return dynamic
+        return cfg.RISK_PER_TRADE_PCT
 
     def _in_sl_zone(self, state: State, current_price: float, signal_side: str = "") -> bool:
         """
@@ -133,6 +81,24 @@ class RiskManager:
     def can_trade(self, state: State, live_balance: float | None = None, signal_side: str = "") -> bool:
         """Return True if it is safe to open a new trade right now."""
 
+        # ── Consecutive-SL circuit breaker ────────────────────────────────────
+        # After 3 straight SLs, block all new entries for 5 hours (60 × 5m candles).
+        # Mirrors backtest.py MAX_CONSECUTIVE_SL=3 / SL_PAUSE_CANDLES=60 logic.
+        MAX_CONSECUTIVE_SL = 3
+        SL_PAUSE_SECONDS   = 60 * 300  # 60 candles × 5 min = 5 hours
+        if getattr(state, "consecutive_sl", 0) >= MAX_CONSECUTIVE_SL:
+            seconds_since_close = time.time() - state.last_close_ts
+            if seconds_since_close < SL_PAUSE_SECONDS:
+                log.warning(
+                    f"can_trade=False  reason=consecutive_sl_circuit_breaker  "
+                    f"consecutive_sl={state.consecutive_sl}  "
+                    f"pause_remaining={int((SL_PAUSE_SECONDS - seconds_since_close) / 60)}min"
+                )
+                return False
+            else:
+                # Pause expired — reset the streak so we don't re-trigger immediately
+                state.consecutive_sl = 0
+
         # Dynamic cooldown — longer after SL hits and consecutive losses
         cooldown_seconds = self._dynamic_cooldown_seconds(state)
         seconds_since_close = time.time() - state.last_close_ts
@@ -160,17 +126,8 @@ class RiskManager:
             log.debug("can_trade=False  reason=anti_revenge_zone")
             return False
 
-        # Daily drawdown circuit breaker (Option B — replaces WR-based trade cap).
-        # Steps 2+3 already shrink size and slow pacing during bad streaks.
-        # This is the hard stop: if we've lost MAX_DAILY_LOSS_PCT of balance
-        # today, no new trades for the rest of the day.
-        daily_loss = state.daily_loss_pct()
-        if daily_loss <= -cfg.MAX_DAILY_LOSS_PCT:
-            log.warning(
-                "can_trade=False  reason=max_daily_loss  "
-                f"daily_loss={daily_loss:.2f}%  limit={cfg.MAX_DAILY_LOSS_PCT}%"
-            )
-            return False
+        # No hard drawdown stop — position sizing already scales down via
+        # _dynamic_risk_pct() as losses accumulate. Mirrors backtest.py behaviour.
 
         # Paper: balance must be positive. By this point position is guaranteed
         # to be None (checked above), so paper_balance is the settled balance.
@@ -239,6 +196,12 @@ class RiskManager:
         # do NOT multiply here or the position becomes leverage× too large.
         qty = risk_usdt / sl_distance
 
+        # Leverage cap — prevents oversized positions relative to account balance.
+        # Mirrors backtest.py calc_qty() behaviour.
+        max_notional = balance * cfg.LEVERAGE
+        max_qty = max_notional / entry_price
+        qty = min(qty, max_qty)
+
         # Round down to nearest QTY_STEP (configured per symbol in .env).
         # Use math.floor(round(...)) to avoid float precision errors where
         # e.g. 0.3 / 0.1 = 2.9999999999996 causing int() to truncate wrongly.
@@ -303,9 +266,14 @@ class RiskManager:
         regime    = getattr(pos, "regime", "TREND")
         rp        = self.regime_params(regime)
 
+        # Signal type — continuations arm the trail earlier (1.5R) because they
+        # ride existing momentum. All other signals get 2.0R breathing room.
+        # Mirrors backtest.py check_trail() logic.
+        signal_type = getattr(pos, "signal_type", "")
+
         if entry_atr and entry_atr > 0:
             sl_dist       = entry_atr * rp["sl"]   # 1R in price terms (frozen at entry)
-            activate_dist = sl_dist * 2.0           # trail arms at +2R
+            activate_dist = sl_dist * 1.5 if signal_type == "continuation" else sl_dist * 2.0
             callback_dist = sl_dist * 1.0           # trail floor moves up 1R at a time
         else:
             # Fallback: fixed-% when ATR unavailable (warm-up edge case)

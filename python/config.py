@@ -43,13 +43,13 @@ class Config:
     KLINE_INTERVAL: str  = os.getenv("KLINE_INTERVAL", "5m")
 
     # ── Futures ────────────────────────────────────────────────────────────────
-    LEVERAGE: int        = _int("LEVERAGE", 10)
+    LEVERAGE: int        = _int("LEVERAGE", 5)
     MARGIN_TYPE: str     = os.getenv("MARGIN_TYPE", "ISOLATED").upper()
 
     # (old break-retest / OI params removed — strategy is now trend-following)
 
     # ── Risk ───────────────────────────────────────────────────────────────────
-    RISK_PER_TRADE_PCT: float  = _float("RISK_PER_TRADE_PCT", 1.0)
+    RISK_PER_TRADE_PCT: float  = _float("RISK_PER_TRADE_PCT", 5.0)
     # MAX_DAILY_LOSS_PCT: hard stop for the day — no new trades once daily PnL
     # drops below this % of starting balance. Raised to 5% (from 3%) so that
     # a choppy morning doesn't block the afternoon trend (see Step 10 analysis).
@@ -64,13 +64,13 @@ class Config:
     # NOTE: SL_ATR_MULT is fallback-only when ATR=None (warm-up edge case).
     SL_ATR_MULT: float         = _float('SL_ATR_MULT', 2.0)   # fallback
 
-    CHOP_SL_MULT:        float = _float('CHOP_SL_MULT',        2.0)
-    TREND_SL_MULT:       float = _float('TREND_SL_MULT',       2.5)
-    STRONG_TREND_SL_MULT: float = _float('STRONG_TREND_SL_MULT', 3.0)
+    CHOP_SL_MULT:        float = _float('CHOP_SL_MULT',        1.0)
+    TREND_SL_MULT:       float = _float('TREND_SL_MULT',       2.0)
+    STRONG_TREND_SL_MULT: float = _float('STRONG_TREND_SL_MULT', 2.5)
 
     # Block all new entries when market_regime == CHOP (ADX < 45, weak momentum).
     # Set CHOP_BLOCK=false in .env to re-enable per-bot if needed.
-    CHOP_BLOCK: bool = os.getenv('CHOP_BLOCK', 'true').lower() == 'true'
+    CHOP_BLOCK: bool = os.getenv('CHOP_BLOCK', 'false').lower() == 'true'
 
     # Minimum price movement (as ATR multiple) required before a FLIP is allowed.
     # FLIP is suppressed if abs(mark_price - entry) < FLIP_MIN_MOVE_ATR × ATR.

@@ -44,6 +44,11 @@ class Position:
     # ATR at entry time — used for dynamic trail distances in update_trail()
     atr:             Optional[float] = None
 
+    # Signal type that opened this position — used by update_trail() to set
+    # continuation-specific trail activation (1.5R vs 2.0R for other signals).
+    # Values: 'di_snap' | 'exhaustion_armed' | 'continuation' | 'cross'
+    signal_type:     str = ""
+
     # Market regime at entry time — governs SL/TP/trail multipliers for this position.
     # Frozen at open so mid-trade regime changes don't alter the position's risk profile.
     # Values: 'STRONG_TREND' | 'TREND' | 'CHOP'
@@ -72,6 +77,10 @@ class Position:
     # tp1_price is frozen at open; 0.0 = degraded warmup state (SL-only).
     is_exhaustion_armed:  bool  = False  # True if opened by section 1b armed logic
     tp1_price:            float = 0.0    # TP level (entry ± 1.5×ATR) — full close
+
+    # Zombie scratch exit price — set by maybe_exit() before calling close_position()
+    # so the exact breakeven price is used instead of the current mark_price tick.
+    zombie_exit_price:    float = 0.0
 
     # Legacy stubs — keep so any stale state.json fields deserialise without error
     tp2_price:            float = 0.0

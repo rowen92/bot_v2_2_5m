@@ -86,6 +86,18 @@ class OrderManager:
             pos.best_price          = entry    # initialise trailing high-water-mark
             pos.atr                 = atr      # stored so update_trail() can use ATR-based distances
             pos.regime              = regime   # frozen at entry — governs trail for the life of this position
+
+            # Signal type — drives trail activation threshold in update_trail().
+            # Continuations use 1.5R, all others use 2.0R (mirrors backtest.py).
+            if is_di_snap:
+                pos.signal_type = "di_snap"
+            elif strategy is not None and strategy.was_exhaustion_reversal():
+                pos.signal_type = "exhaustion_armed"
+            elif strategy is not None and strategy.was_continuation():
+                pos.signal_type = "continuation"
+            else:
+                pos.signal_type = "cross"
+
             pos.is_di_snap          = is_di_snap
             pos.di_snap_tp          = tp if is_di_snap else 0.0
             pos.is_exhaustion_armed = is_exhaustion_armed
@@ -124,7 +136,12 @@ class OrderManager:
         if pos is None:
             return 0.0
 
-        exit_price = state.mark_price
+        # Zombie scratch pins the exit to exact breakeven — use that price,
+        # not the current mark_price tick (which may have moved on).
+        if reason == "zombie_scratch" and getattr(pos, "zombie_exit_price", 0.0) > 0:
+            exit_price = pos.zombie_exit_price
+        else:
+            exit_price = state.mark_price
 
         if cfg.is_paper():
             pnl = self._paper_close(pos, exit_price, state)
@@ -204,6 +221,43 @@ class OrderManager:
         candle_close = state.last_candle_close
 
         hit = None
+
+        # ── Max hold duration: force-close after 10 hours (120 × 5m candles) ──
+        # A trade open 10+ hours without hitting SL/TP is a zombie — exit at SL.
+        # Mirrors backtest.py MAX_HOLD_CANDLES=120 logic.
+        MAX_HOLD_SECONDS = 120 * 300  # 120 candles × 5 min
+        open_duration = time.time() - pos.open_time
+        if open_duration >= MAX_HOLD_SECONDS:
+            hit = "sl"
+
+        # ── Zombie Scratch: breakeven exit after 6 candles (30 min) ──────────
+        # If price has not hit SL/TP after 30 min, scratch the trade at breakeven
+        # if price wicks to breakeven. Mirrors backtest.py zombie scratch logic.
+        ZOMBIE_CANDLES_SECONDS = 6 * 300  # 6 candles × 5 min
+        if hit is None and open_duration >= ZOMBIE_CANDLES_SECONDS:
+            f = cfg.TAKER_FEE_PCT / 100.0
+            buffer = 0.0010  # 0.10% profit buffer to guarantee green PnL
+            breakeven_long  = pos.entry_price * (1 + f + buffer) / (1 - f)
+            breakeven_short = pos.entry_price * (1 - f - buffer) / (1 + f)
+
+            if pos.side == "long":
+                # Let it run if we are already in profit at current close
+                if candle_close > 0 and candle_close > breakeven_long:
+                    pass
+                elif price >= breakeven_long:
+                    # Wicked up to breakeven — scratch it
+                    if not (pos.trail_active and pos.trail_stop > breakeven_long):
+                        pos.zombie_exit_price = breakeven_long
+                        hit = "zombie_scratch"
+            elif pos.side == "short":
+                # Let it run if we are already in profit at current close
+                if candle_close > 0 and candle_close < breakeven_short:
+                    pass
+                elif price <= breakeven_short:
+                    # Wicked down to breakeven — scratch it
+                    if not (pos.trail_active and pos.trail_stop < breakeven_short):
+                        pos.zombie_exit_price = breakeven_short
+                        hit = "zombie_scratch"
 
         if pos.is_di_snap:
             # ── DI-snap exits: fixed TP at EMA21, candle-close SL ────────────
