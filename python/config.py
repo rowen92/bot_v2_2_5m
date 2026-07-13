@@ -78,6 +78,10 @@ class Config:
     # DOGE overrides to 0.5 in .env — tighter filter needed for low-volatility oscillation
     FLIP_MIN_MOVE_ATR: float = _float('FLIP_MIN_MOVE_ATR', 0.3)
 
+    # Enable/disable flip trades (closing current position and reversing on opposite signal).
+    # Set ENABLE_FLIP=false in .env to disable — backtest shows worse performance on WLD.
+    ENABLE_FLIP: bool = os.getenv('ENABLE_FLIP', 'false').lower() == 'true'
+
     # ── Fixed-% fallback (used only when ATR is unavailable) ──────────────────
     TAKE_PROFIT_PCT: float = _float("TAKE_PROFIT_PCT", 0.40)  # unused at runtime
     STOP_LOSS_PCT:   float = _float("STOP_LOSS_PCT",   0.20)

@@ -77,6 +77,10 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
                  (signal == "short" and pos.side == "long"))
         )
 
+        if is_flip and not cfg.ENABLE_FLIP:
+            log.debug(f"FLIP suppressed (ENABLE_FLIP=false) — staying in {pos.side.upper()}")
+            return
+
         if is_flip:
             # Opposite signal while in a position — close current and flip.
             # Only fires if signal passed all filters (ADX, volume, spike, trend).
