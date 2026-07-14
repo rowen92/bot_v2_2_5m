@@ -46,25 +46,6 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
         state.live_atr = indicators["atr"]
 
     if signal != "none":
-        # Block continuation entries on the very first trade after restart.
-        # On a fresh start we have no position history — we don't know how far
-        # the trend has already run or whether it is near exhaustion.
-        # Crossover entries are fine (fresh cross = fresh signal).
-        if not state.first_trade_done and strategy.was_continuation():
-            adx_now = indicators.get("adx", 0)
-            # Allow strong-trend continuations at startup (ADX >= 60 = clearly
-            # not near exhaustion). Only block weak/borderline continuations
-            # where we genuinely don't know if the trend is aging.
-            if adx_now < 55.0:
-                log.info(
-                    f"STARTUP: continuation {signal.upper()} blocked — "
-                    f"adx={adx_now:.1f} < 55; waiting for a fresh crossover or stronger trend"
-                )
-                return
-            log.info(
-                f"STARTUP: continuation {signal.upper()} ALLOWED — "
-                f"adx={adx_now:.1f} >= 55 (strong trend, low exhaustion risk)"
-            )
 
         live_bal = None
         if not cfg.is_paper():

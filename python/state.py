@@ -152,12 +152,6 @@ class State:
         self.last_sl_atr: float = 0.0
         self.last_sl_side: str = ""   # 'long' | 'short' — side of the last SL trade
 
-        # Startup guard: False until the bot opens its first trade after (re)start.
-        # bot.py uses this to block continuation signals on the very first entry —
-        # on a fresh start we have no position history so we don't know how old
-        # the trend is or whether it's already exhausted.
-        self.first_trade_done: bool = False
-
         # Concurrency guard: prevents a second tick from triggering a second
         # close while an async _live_close / _paper_close is still in-flight.
         self.is_closing: bool = False

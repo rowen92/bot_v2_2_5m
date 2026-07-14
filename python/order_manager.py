@@ -116,7 +116,6 @@ class OrderManager:
                     f"exhaustion-armed TP  tp={pos.tp1_price:.4f} (+1.5×ATR)  sl={sl:.4f}"
                 )
             state.position = pos
-            state.first_trade_done = True  # unlock continuation entries on next candle
             tlog.log_open(signal, entry, qty, tp, sl, cfg.TRADING_MODE, regime=regime)
 
         return pos

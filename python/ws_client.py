@@ -126,6 +126,42 @@ async def _run_stream(
         delay = min(delay * 2, 60)  # exponential backoff, cap at 60s
 
 
+_PRESEED_CANDLES = 250  # REST candles fetched on startup to converge indicators
+
+
+async def preseed_candles(client: AsyncClient, state: State) -> None:
+    """Fetch the last _PRESEED_CANDLES closed candles via REST before the WS starts.
+
+    This ensures EMAs, ADX, and all other indicators are fully converged from
+    the very first live candle, making bot signals match backtest signals exactly.
+    Without this, the bot runs on a cold 25-candle warmup and indicators diverge
+    from backtest values for the first ~200 candles.
+    """
+    try:
+        log.info(f"Pre-seeding {_PRESEED_CANDLES} candles via REST ({cfg.KLINE_INTERVAL}) …")
+        raw = await client.futures_klines(
+            symbol=cfg.SYMBOL,
+            interval=cfg.KLINE_INTERVAL,
+            limit=_PRESEED_CANDLES + 1,  # +1 because the last candle is still open
+        )
+        # Drop the last entry — it's the currently open (incomplete) candle
+        closed = raw[:-1]
+        for k in closed:
+            candle = Candle(
+                open_time=int(k[0]),
+                open=float(k[1]),
+                high=float(k[2]),
+                low=float(k[3]),
+                close=float(k[4]),
+                volume=float(k[5]),
+                is_closed=True,
+            )
+            state.add_closed_candle(candle)
+        log.info(f"Pre-seed complete — {state.candle_count()} candles loaded, indicators ready")
+    except Exception as exc:
+        log.error(f"Pre-seed failed: {exc} — falling back to live warmup")
+
+
 async def run_streams(
     client: AsyncClient,
     state: State,
@@ -138,6 +174,10 @@ async def run_streams(
     kline_stream = f"{sym}@kline_{interval}"
     depth_stream = f"{sym}@depth20@100ms"
     mark_stream  = f"{sym}@markPrice@1s"
+
+    # Pre-seed historical candles so indicators are fully converged before
+    # the first live signal — this makes bot behaviour match backtest exactly.
+    await preseed_candles(client, state)
 
     log.info(
         f"Subscribing — kline: {kline_stream}  depth: {depth_stream}"
