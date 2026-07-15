@@ -702,8 +702,8 @@ class ScalpingStrategy:
         # DI gap filter: directional pressure must be clearly one-sided (>= 15 gap).
         # Weak DI separation (e.g. plus_di=15 minus_di=18) means no real momentum
         # behind the move — continuation entries in these conditions consistently SL.
-        _di_gap_long  = (_plus_di  - _minus_di) >= 15.0   # bulls clearly dominant
-        _di_gap_short = (_minus_di - _plus_di)  >= 15.0   # bears clearly dominant
+        _di_gap_long  = (_plus_di  - _minus_di) >= 20.0   # bulls clearly dominant
+        _di_gap_short = (_minus_di - _plus_di)  >= 20.0   # bears clearly dominant
 
         # 2. The Dip (Did price retrace to at least the EMA8?)
         dipped_long = row["low"] <= ema_fast
