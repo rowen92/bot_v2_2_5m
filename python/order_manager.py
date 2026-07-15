@@ -56,20 +56,19 @@ class OrderManager:
             log.warning(f"open skipped: position_size=0  balance={balance:.2f}  entry={entry:.4f}")
             return None
 
-        # DI-snap entries use fixed SL (trigger candle high/low) and fixed TP (EMA21).
+        # DI-snap entries use ATR-based SL + fixed TP at 2R (mirrors backtest.py).
         # All other entries use ATR-based SL + trail (no fixed TP).
         is_di_snap = strategy is not None and strategy.was_di_snap()
+        sl = rm.sl_price(entry, signal, atr=atr, regime=regime)
         if is_di_snap:
-            snap = strategy.di_snap_levels()
-            sl   = snap["sl"]
-            tp   = snap["tp"]
+            atr_dist = abs(sl - entry)
+            tp = entry - atr_dist * 2 if signal == "short" else entry + atr_dist * 2
             log.info(
                 f"open_position  regime={regime}  signal={signal}  [DI-snap]"
                 f"  entry={entry:.4f}  sl={sl:.4f}  tp={tp:.4f}  qty={qty}"
             )
         else:
-            sl = rm.sl_price(entry, signal, atr=atr, regime=regime)
-            tp = sl  # no fixed TP — trail at +2R is the only exit; tp field kept for dataclass compat
+            tp = 0.0  # no fixed TP — trail at +2R is the only exit; matches backtest.py
             log.info(
                 f"open_position  regime={regime}  signal={signal}  "
                 f"entry={entry:.4f}  sl={sl:.4f}  qty={qty}"
@@ -103,18 +102,8 @@ class OrderManager:
             pos.is_exhaustion_armed = is_exhaustion_armed
             pos.ema21_trail_stop    = 0.0
 
-            # Flat single TP for exhaustion-armed entries — frozen at open.
-            # TP = entry ± 1.5×ATR  → full close, booked immediately as a win.
-            # FLIP still takes priority if an opposite signal fires first.
-            # SL is ~1×ATR away (CHOP regime) → RR ≈ 1.5:1
-            if is_exhaustion_armed and atr:
-                if signal == "long":
-                    pos.tp1_price = entry + 1.5 * atr
-                else:
-                    pos.tp1_price = entry - 1.5 * atr
-                log.info(
-                    f"exhaustion-armed TP  tp={pos.tp1_price:.4f} (+1.5×ATR)  sl={sl:.4f}"
-                )
+            # exhaustion_armed uses trail exit only (no flat TP) — mirrors backtest.py
+            # tp1_price stays 0.0 (default) so the exit block falls through to trail
             state.position = pos
             tlog.log_open(signal, entry, qty, tp, sl, cfg.TRADING_MODE, regime=regime)
 
@@ -234,10 +223,8 @@ class OrderManager:
         # if price wicks to breakeven. Mirrors backtest.py zombie scratch logic.
         ZOMBIE_CANDLES_SECONDS = 6 * 300  # 6 candles × 5 min
         if hit is None and open_duration >= ZOMBIE_CANDLES_SECONDS:
-            f = cfg.TAKER_FEE_PCT / 100.0
-            buffer = 0.0010  # 0.10% profit buffer to guarantee green PnL
-            breakeven_long  = pos.entry_price * (1 + f + buffer) / (1 - f)
-            breakeven_short = pos.entry_price * (1 - f - buffer) / (1 + f)
+            breakeven_long  = rm.breakeven_price(pos.entry_price, "long")
+            breakeven_short = rm.breakeven_price(pos.entry_price, "short")
 
             if pos.side == "long":
                 # Let it run if we are already in profit at current close
@@ -259,32 +246,17 @@ class OrderManager:
                         hit = "zombie_scratch"
 
         if pos.is_di_snap:
-            # ── DI-snap exits: fixed TP at EMA21, candle-close SL ────────────
+            # ── DI-snap exits: fixed TP at 2R, candle-close SL ───────────────
+            # TP takes priority over zombie scratch; SL does not overwrite it.
             if pos.side == "long":
                 if price >= pos.di_snap_tp:
                     hit = "tp"
-                elif candle_close > 0 and candle_close <= pos.sl_price:
+                elif hit is None and candle_close > 0 and candle_close <= pos.sl_price:
                     hit = "sl"
             else:  # short
                 if price <= pos.di_snap_tp:
                     hit = "tp"
-                elif candle_close > 0 and candle_close >= pos.sl_price:
-                    hit = "sl"
-
-        elif pos.is_exhaustion_armed:
-            # ── Exhaustion-armed (1b): flat TP exit, candle-close SL ─────────
-            # Single flat TP at +1.5×ATR — full close, booked immediately.
-            # FLIP (opposite signal) takes priority and is handled before this block.
-            # tp1_price is set at open; 0.0 means no TP (degraded warmup state → SL only).
-            if pos.side == "long":
-                if pos.tp1_price > 0 and price >= pos.tp1_price:
-                    hit = "tp"
-                elif candle_close > 0 and candle_close <= pos.sl_price:
-                    hit = "sl"
-            else:  # short
-                if pos.tp1_price > 0 and price <= pos.tp1_price:
-                    hit = "tp"
-                elif candle_close > 0 and candle_close >= pos.sl_price:
+                elif hit is None and candle_close > 0 and candle_close >= pos.sl_price:
                     hit = "sl"
 
         else:

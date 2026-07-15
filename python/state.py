@@ -60,23 +60,14 @@ class Position:
     trail_active:    bool  = False  # True once activate threshold is crossed
     trail_stop:      float = 0.0   # current trailing stop level
 
-    # DI-snap exhaustion entries use a fixed TP (EMA21 at entry) and a tight SL
-    # (trigger candle high/low) instead of the ATR trail system.
+    # DI-snap entries use ATR-based SL + fixed TP at 2R (entry ± 2×sl_dist).
+    # All other entries (exhaustion, continuation, cross) use trail exit only.
     is_di_snap:      bool  = False  # True if this position was opened by DI-snap logic
-    di_snap_tp:      float = 0.0    # fixed TP = EMA21 at entry time
+    di_snap_tp:      float = 0.0    # fixed TP = entry ± 2×sl_dist (mirrors backtest.py)
 
-    # Exhaustion-armed entries (1b) use a two-level flat TP exit — no trail.
-    # In CHOP (ADX 20-49, which is almost always the regime on WLD 5m), price
-    # travels only 0.5-1.5×ATR to EMA21 and then reverses. A trail that arms at
-    # +3×ATR can never fire. Instead:
-    #
-    #   TP  = entry ± 1.5×ATR → full close, booked immediately as a win
-    #   SL  = entry ∓ 1×ATR  (CHOP regime) → RR ≈ 1.5:1
-    #   FLIP (opposite signal) always takes priority over TP
-    #
-    # tp1_price is frozen at open; 0.0 = degraded warmup state (SL-only).
+    # Exhaustion-armed entries use trail exit only — no flat TP (mirrors backtest.py).
     is_exhaustion_armed:  bool  = False  # True if opened by section 1b armed logic
-    tp1_price:            float = 0.0    # TP level (entry ± 1.5×ATR) — full close
+    tp1_price:            float = 0.0    # unused — kept for state.json deserialisation compat
 
     # Zombie scratch exit price — set by maybe_exit() before calling close_position()
     # so the exact breakeven price is used instead of the current mark_price tick.

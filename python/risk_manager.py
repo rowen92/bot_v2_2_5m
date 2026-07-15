@@ -334,3 +334,23 @@ class RiskManager:
                     return True  # close signal
 
         return False
+
+    # ── Breakeven price ───────────────────────────────────────────────────────
+
+    def breakeven_price(self, entry: float, side: str, buffer: float = 0.0010) -> float:
+        """Return the minimum exit price that covers both taker fees + a small profit buffer.
+
+        Formula (round-trip fee on notional):
+            long  → entry × (1 + f + buffer) / (1 - f)
+            short → entry × (1 - f - buffer) / (1 + f)
+
+        Args:
+            entry:  position entry price
+            side:   'long' or 'short'
+            buffer: fractional profit cushion on top of fees (default 0.10%)
+        """
+        f = cfg.TAKER_FEE_PCT / 100.0
+        if side == "long":
+            return entry * (1 + f + buffer) / (1 - f)
+        else:
+            return entry * (1 - f - buffer) / (1 + f)
