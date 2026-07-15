@@ -699,6 +699,12 @@ class ScalpingStrategy:
         strong_uptrend = (ema_fast > ema_slow > ema_trend) and (row["adx"] >= 35.0)
         strong_downtrend = (ema_fast < ema_slow < ema_trend) and (row["adx"] >= 35.0)
 
+        # DI gap filter: directional pressure must be clearly one-sided (>= 15 gap).
+        # Weak DI separation (e.g. plus_di=15 minus_di=18) means no real momentum
+        # behind the move — continuation entries in these conditions consistently SL.
+        _di_gap_long  = (_plus_di  - _minus_di) >= 15.0   # bulls clearly dominant
+        _di_gap_short = (_minus_di - _plus_di)  >= 15.0   # bears clearly dominant
+
         # 2. The Dip (Did price retrace to at least the EMA8?)
         dipped_long = row["low"] <= ema_fast
         dipped_short = row["high"] >= ema_fast
@@ -710,7 +716,7 @@ class ScalpingStrategy:
         rip_short = (close < row["open"]) and (close < ema_fast)
 
         # Execute Long Continuation
-        if strong_uptrend and spike_ok_cont and bias_long and ema_sep_ok and ema50_rising and dipped_long and rip_long and rsi_ok_long:
+        if strong_uptrend and spike_ok_cont and bias_long and ema_sep_ok and ema50_rising and dipped_long and rip_long and rsi_ok_long and _di_gap_long:
             _pb_dist = (close - ema_slow) / atr_val
             log.info(
                 f"SIGNAL long  |  continuation (DIP & RIP)  adx={row['adx']:.1f}  "
@@ -723,7 +729,7 @@ class ScalpingStrategy:
             return "long"
 
         # Execute Short Continuation
-        if strong_downtrend and spike_ok_cont and bias_short and ema_sep_ok and ema50_falling and dipped_short and rip_short and rsi_ok_short:
+        if strong_downtrend and spike_ok_cont and bias_short and ema_sep_ok and ema50_falling and dipped_short and rip_short and rsi_ok_short and _di_gap_short:
             _pb_dist = (ema_slow - close) / atr_val
             log.info(
                 f"SIGNAL short |  continuation (DIP & RIP)  adx={row['adx']:.1f}  "
