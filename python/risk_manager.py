@@ -83,8 +83,8 @@ class RiskManager:
 
         # ── Consecutive-SL circuit breaker ────────────────────────────────────
         # After 3 straight SLs, block all new entries for 5 hours (60 × 5m candles).
-        # Mirrors backtest.py MAX_CONSECUTIVE_SL=3 / SL_PAUSE_CANDLES=60 logic.
-        MAX_CONSECUTIVE_SL = 3
+        # Mirrors backtest.py MAX_CONSECUTIVE_SL=5 / SL_PAUSE_CANDLES=60 logic.
+        MAX_CONSECUTIVE_SL = 5
         SL_PAUSE_SECONDS   = 60 * 300  # 60 candles × 5 min = 5 hours
         if getattr(state, "consecutive_sl", 0) >= MAX_CONSECUTIVE_SL:
             seconds_since_close = time.time() - state.last_close_ts
