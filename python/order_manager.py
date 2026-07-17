@@ -58,8 +58,16 @@ class OrderManager:
 
         # DI-snap entries use ATR-based SL + fixed TP at 2R (mirrors backtest.py).
         # All other entries use ATR-based SL + trail (no fixed TP).
-        is_di_snap = strategy is not None and strategy.was_di_snap()
+        is_di_snap    = strategy is not None and strategy.was_di_snap()
+        is_grind_short = strategy is not None and strategy.was_grind_short()
         sl = rm.sl_price(entry, signal, atr=atr, regime=regime)
+
+        # Grind short = slot blocker only. Override qty to minimum and SL to
+        # 0.5×ATR so it always zombies out cheaply. Mirrors backtest.py logic.
+        if is_grind_short and atr and atr > 0:
+            qty = cfg.QTY_MIN
+            sl  = entry + atr * 0.5 if signal == "short" else entry - atr * 0.5
+            log.info(f"open_position  [GRIND BLOCKER]  qty={qty}  sl={sl:.4f}")
         if is_di_snap:
             atr_dist = abs(sl - entry)
             tp = entry - atr_dist * 2 if signal == "short" else entry + atr_dist * 2
@@ -92,6 +100,8 @@ class OrderManager:
                 pos.signal_type = "di_snap"
             elif strategy is not None and strategy.was_exhaustion_reversal():
                 pos.signal_type = "exhaustion_armed"
+            elif is_grind_short:
+                pos.signal_type = "grind_short"
             elif strategy is not None and strategy.was_continuation():
                 pos.signal_type = "continuation"
             else:

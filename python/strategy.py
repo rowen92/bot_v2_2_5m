@@ -89,6 +89,7 @@ class ScalpingStrategy:
         self._short_armed_remaining: int = 0    # candles before SHORT arm expires
         self._long_armed_remaining: int = 0     # candles before LONG arm expires
         self._exhaustion_sl_lockout: int = 0    # candles to block re-arming after an exhaustion SL
+        self._last_signal_was_grind_short: bool = False  # set by grind short continuation
 
     def cancel_exhaustion_arms(self, lockout_candles: int = 6) -> None:
         """Cancel both exhaustion arms and block re-arming for lockout_candles.
@@ -127,6 +128,13 @@ class ScalpingStrategy:
           TP = EMA21 at signal time (fixed mean-reversion target)
         """
         return self._last_signal_was_di_snap
+
+    def was_grind_short(self) -> bool:
+        """True if the last signal was a grind short continuation.
+        Distinct from Dip & Rip continuation — fires in waterfall bear trends
+        where price never bounces to EMA8, so the standard dip/rip is impossible.
+        """
+        return self._last_signal_was_grind_short
 
     def di_snap_levels(self) -> dict:
         """Return the SL and TP levels captured at the time of the DI-snap signal.
@@ -505,6 +513,7 @@ class ScalpingStrategy:
             self._last_signal_was_continuation = False
             self._last_signal_was_exhaustion_reversal = False
             self._last_signal_was_di_snap = False
+            self._last_signal_was_grind_short = False
             self._long_armed = False   # consumed
             return "long"
 
@@ -518,6 +527,7 @@ class ScalpingStrategy:
             self._last_signal_was_continuation = False
             self._last_signal_was_exhaustion_reversal = False
             self._last_signal_was_di_snap = False
+            self._last_signal_was_grind_short = False
             self._short_armed = False  # consumed
             return "short"
 
@@ -576,12 +586,16 @@ class ScalpingStrategy:
             self._last_signal_was_continuation = False
             self._last_signal_was_exhaustion_reversal = True
             self._last_signal_was_di_snap = False
+            self._last_signal_was_grind_short = False
             return "short"
 
         # Block exhaustion LONG if bears are still clearly dominant (-DI >> +DI).
-        _di_balanced_long = _minus_di < _plus_di * 2.0   # bulls must be closing the gap
+        _di_balanced_long = _minus_di < _plus_di * 2.0   # bears not more than 2× bulls
+        # Bulls must actually lead at entry — +DI must be strictly above -DI.
+        # e.g. 07/17 06:20: +DI=16.76, -DI=22.48 → bears still dominant → skip.
+        _bulls_leading = _plus_di > _minus_di
 
-        if self._long_armed and self._exhaustion_sl_lockout == 0 and vol_ok and in_downtrend and ema_sep_ok and close < ema_slow and ema50_falling and _di_balanced_long and _long_candle_ok and rsi_ok_long:
+        if self._long_armed and self._exhaustion_sl_lockout == 0 and vol_ok and in_downtrend and ema_sep_ok and close < ema_slow and ema50_falling and _di_balanced_long and _bulls_leading and _long_candle_ok and rsi_ok_long:
             _pb_dist = (ema_slow - close) / atr_val
             log.info(
                 f"SIGNAL long  |  exhaustion armed  armed_remaining={self._long_armed_remaining}"
@@ -593,6 +607,7 @@ class ScalpingStrategy:
             self._last_signal_was_continuation = False
             self._last_signal_was_exhaustion_reversal = True
             self._last_signal_was_di_snap = False
+            self._last_signal_was_grind_short = False
             return "long"
 
         # ── 1c. DI-snap exhaustion entries ────────────────────────────────────
@@ -649,6 +664,7 @@ class ScalpingStrategy:
             self._last_signal_was_continuation = False
             self._last_signal_was_exhaustion_reversal = True
             self._last_signal_was_di_snap = True
+            self._last_signal_was_grind_short = False
             self._di_snap_levels = {"sl": _snap_sl, "tp": _snap_tp}
             # Cancel ADX-peak arm — same exhaustion event, prevent a conflicting
             # FLIP signal if the EMA cross arrives while this position is open.
@@ -683,6 +699,7 @@ class ScalpingStrategy:
             self._last_signal_was_continuation = False
             self._last_signal_was_exhaustion_reversal = True
             self._last_signal_was_di_snap = True
+            self._last_signal_was_grind_short = False
             self._di_snap_levels = {"sl": _snap_sl, "tp": _snap_tp}
             # Cancel ADX-peak arm — same exhaustion event, prevent a conflicting
             # FLIP signal if the EMA cross arrives while this position is open.
@@ -726,6 +743,7 @@ class ScalpingStrategy:
             self._last_signal_was_continuation = True
             self._last_signal_was_exhaustion_reversal = False
             self._last_signal_was_di_snap = False
+            self._last_signal_was_grind_short = False
             return "long"
 
         # Execute Short Continuation
@@ -739,6 +757,54 @@ class ScalpingStrategy:
             self._last_signal_was_continuation = True
             self._last_signal_was_exhaustion_reversal = False
             self._last_signal_was_di_snap = False
+            self._last_signal_was_grind_short = False
+            return "short"
+
+        # ── 2b. Grind Short continuation ─────────────────────────────────────
+        # In a grinding bear waterfall, EMA8 rides below price — the candle high
+        # never reaches EMA8, so the Dip & Rip condition (high >= ema_fast) is
+        # structurally impossible. This catches re-entries in those conditions:
+        #   - Full bear EMA stack: EMA8 < EMA21 < EMA50
+        #   - ADX >= 35 (trend still strong), EMA50 actively falling
+        #   - Bears clearly dominant: -DI gap >= 20 (same as Dip&Rip, no relaxation)
+        #   - Bulls near-dead: +DI <= 12 — if bulls still have meaningful presence
+        #     (>12) price can snap back hard enough to SL; losses all had +DI > 10
+        #   - Red candle closing below EMA8 — price confirming bear continuation
+        #   - bias_short (below EMA50) and ema_sep_ok (not at equilibrium)
+        # Spike lockout still applies: don't re-enter the bar of a vol spike.
+        _grind_di_gap_short  = (_minus_di - _plus_di) >= 20.0   # tightened from 15
+        _grind_bulls_fading  = _plus_di <= 12.0                  # bulls must be near-dead
+        # Grind short only fires in STRONG_TREND (ADX>=50) — NOT plain TREND (ADX 35-49).
+        # In 30d backtest: all 6 SL losses were TREND regime (ADX 35-49); all 5 winners
+        # were STRONG_TREND (ADX>=50) or CHOP. ADX 35-49 has enough residual bull energy
+        # for mean-reversion bounces that hit SL before continuation resumes.
+        # Note: strong_downtrend already requires ADX>=35, so we just lift the floor to 50.
+        _grind_regime_ok     = row["adx"] >= 50.0
+        _grind_short = (
+            strong_downtrend          # EMA8 < EMA21 < EMA50, ADX >= 35
+            and spike_ok_cont         # spike lockout
+            and bias_short            # close < EMA50
+            and ema_sep_ok            # EMA8 not at equilibrium with EMA50
+            and ema50_falling         # EMA50 actively declining
+            and _grind_di_gap_short   # bears clearly dominant (gap >= 20)
+            and _grind_bulls_fading   # bulls near-dead (+DI <= 12)
+            and _grind_regime_ok      # only STRONG_TREND (ADX>=50)
+            and close < row["open"]   # red candle
+            and close < ema_fast      # closing below EMA8 (bear structure intact)
+            and rsi_ok_short          # not oversold (global RSI_OS=30)
+        )
+        if _grind_short:
+            _pb_dist = (ema_slow - close) / atr_val
+            log.info(
+                f"SIGNAL short |  continuation (GRIND)  adx={row['adx']:.1f}  "
+                f"minus_di={_minus_di:.1f}  plus_di={_plus_di:.1f}  "
+                f"ema50={ema_trend:.4f}  close={close:.4f}  "
+                f"stretch={_pb_dist:.2f}x ATR from EMA21"
+            )
+            self._last_signal_was_continuation = False
+            self._last_signal_was_exhaustion_reversal = False
+            self._last_signal_was_di_snap = False
+            self._last_signal_was_grind_short = True
             return "short"
 
         # ── 3. Exhaustion arming ──────────────────────────────────────────────
