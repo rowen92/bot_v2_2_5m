@@ -258,6 +258,8 @@ class ScalpingStrategy:
             ema50_falling = True
 
         # --- OPTIMIZATION 2: Price-Boundary Spike Lockout Implementation ---
+        # Spike in the direction of the trend = confirmation, not a reason to block.
+        # Only block counter-spike entries (panic reversals).
         vol_avg = row["vol_avg"] if row["vol_avg"] > 0 else 1
         if row["volume"] > vol_avg * SPIKE_VOL_MULT:
             self._spike_active = True
@@ -270,26 +272,37 @@ class ScalpingStrategy:
                 f"  avg={vol_avg:.0f}  range={self._spike_low:.4f}-{self._spike_high:.4f}"
                 f"  spike_dir={self._spike_direction}"
             )
-            return "none"
+            # Don't block yet — fall through so with-trend signals can still fire.
+            # Counter-trend entries are blocked below in the active-boundary check.
         elif self._spike_active:
             if close > self._spike_high or close < self._spike_low:
-                self._spike_active = False # Price escaped the spike block, unlock immediately
+                self._spike_active = False  # Price escaped the spike block, unlock immediately
                 log.debug(f"SPIKE BOUNDARY CLEARED  close={close:.4f} broke range {self._spike_low:.4f}-{self._spike_high:.4f}")
             else:
-                log.debug(f"SPIKE BOUNDARY ACTIVE  close={close:.4f} stuck inside {self._spike_low:.4f}-{self._spike_high:.4f}")
-                return "none"
+                # Still inside the box — only block entries against the spike direction.
+                # With-trend entries (short after down spike, long after up spike) are allowed.
+                _blocked_long  = self._spike_direction == "down"
+                _blocked_short = self._spike_direction == "up"
+                log.debug(
+                    f"SPIKE BOUNDARY ACTIVE  close={close:.4f} inside {self._spike_low:.4f}-{self._spike_high:.4f}"
+                    f"  blocks={'long' if _blocked_long else 'short'}"
+                )
+                # Store which side is blocked so signal checks below can use it.
+                # We don't return "none" here — signal logic will filter via _spike_active flags.
         elif self._spike_direction != "none":
             _ema_sep_local = abs(ema_fast - ema_trend)
             _is_strong_trend = row["adx"] >= 50 and _ema_sep_local >= 1.5 * atr_val
             if self._spike_direction == "down" and in_downtrend:
                 if not _is_strong_trend:
                     self._spike_direction = "none"
-                    return "none"
             if self._spike_direction == "up" and in_uptrend:
                 if not _is_strong_trend:
                     self._spike_direction = "none"
-                    return "none"
             self._spike_direction = "none"
+
+        # Counter-spike guard: block entries opposite to the spike direction.
+        _spike_blocks_long  = self._spike_active and self._spike_direction == "down"
+        _spike_blocks_short = self._spike_active and self._spike_direction == "up"
         # -------------------------------------------------------------------
 
         # --- OPTIMIZATION 3: Relaxed RSI Guard during Parabolic Trends ---
@@ -304,7 +317,7 @@ class ScalpingStrategy:
         # ---------------------------------------------------------------
 
         # ── 1. Crossover entries (fresh cross signal) ─────────────────────────
-        if cross == "bull" and adx_ok and vol_waking_up and spike_ok and in_uptrend and bias_long and ema_gap_ok_long and ema_sep_ok_cross and rsi_ok_long:
+        if cross == "bull" and adx_ok and vol_waking_up and spike_ok and in_uptrend and bias_long and ema_gap_ok_long and ema_sep_ok_cross and rsi_ok_long and not _spike_blocks_long:
             _pb_dist = (close - ema_slow) / atr_val
             log.info(
                 f"SIGNAL long  |  cross=bull  adx={row['adx']:.1f}  "
@@ -318,7 +331,7 @@ class ScalpingStrategy:
             self._long_armed = False
             return "long"
 
-        if cross == "bear" and adx_ok and vol_waking_up and spike_ok and in_downtrend and bias_short and ema_gap_ok_short and ema_sep_ok_cross and rsi_ok_short:
+        if cross == "bear" and adx_ok and vol_waking_up and spike_ok and in_downtrend and bias_short and ema_gap_ok_short and ema_sep_ok_cross and rsi_ok_short and not _spike_blocks_short:
             _pb_dist = (ema_slow - close) / atr_val
             log.info(
                 f"SIGNAL short |  cross=bear  adx={row['adx']:.1f}  "
@@ -344,7 +357,7 @@ class ScalpingStrategy:
         _short_candle_ok     = (not _deep_bear_waterfall) or _bearish_candle
         _long_candle_ok      = (not _deep_bull_waterfall) or _bullish_candle
 
-        if self._short_armed and self._exhaustion_sl_lockout == 0 and vol_ok and in_uptrend and ema_sep_ok and close > ema_slow and ema50_rising and _di_balanced_short and _short_candle_ok and rsi_ok_short:
+        if self._short_armed and self._exhaustion_sl_lockout == 0 and vol_ok and in_uptrend and ema_sep_ok and close > ema_slow and ema50_rising and _di_balanced_short and _short_candle_ok and rsi_ok_short and not _spike_blocks_short:
             self._short_armed = False
             self._short_armed_remaining = 0
             self._last_signal_was_continuation = False
@@ -356,7 +369,7 @@ class ScalpingStrategy:
         _di_balanced_long = _minus_di < _plus_di * 2.0
         _bulls_leading = _plus_di > _minus_di
 
-        if self._long_armed and self._exhaustion_sl_lockout == 0 and vol_ok and in_downtrend and ema_sep_ok and close < ema_slow and ema50_falling and _di_balanced_long and _bulls_leading and _long_candle_ok and rsi_ok_long:
+        if self._long_armed and self._exhaustion_sl_lockout == 0 and vol_ok and in_downtrend and ema_sep_ok and close < ema_slow and ema50_falling and _di_balanced_long and _bulls_leading and _long_candle_ok and rsi_ok_long and not _spike_blocks_long:
             self._long_armed = False
             self._long_armed_remaining = 0
             self._last_signal_was_continuation = False
@@ -392,6 +405,7 @@ class ScalpingStrategy:
             and vol_ok
             and ema50_falling
             and _di_balanced_long
+            and not _spike_blocks_long
         ):
             _snap_sl = close - 1.0 * atr_val
             _snap_tp = max(float(ema_slow), close + 1.5 * atr_val)
@@ -412,6 +426,7 @@ class ScalpingStrategy:
             and vol_ok
             and ema50_rising
             and _di_balanced_short
+            and not _spike_blocks_short
         ):
             _snap_sl = close + 1.0 * atr_val
             _snap_tp = min(float(ema_slow), close - 1.5 * atr_val)
@@ -437,14 +452,14 @@ class ScalpingStrategy:
         rip_long = (close > row["open"]) and (close > ema_fast)
         rip_short = (close < row["open"]) and (close < ema_fast)
 
-        if strong_uptrend and spike_ok_cont and bias_long and ema_sep_ok and ema50_rising and dipped_long and rip_long and rsi_ok_long and _di_gap_long and not _pump_extended:
+        if strong_uptrend and spike_ok_cont and bias_long and ema_sep_ok and ema50_rising and dipped_long and rip_long and rsi_ok_long and _di_gap_long and not _pump_extended and not _spike_blocks_long:
             self._last_signal_was_continuation = True
             self._last_signal_was_exhaustion_reversal = False
             self._last_signal_was_di_snap = False
             self._last_signal_was_grind_short = False
             return "long"
 
-        if strong_downtrend and spike_ok_cont and bias_short and ema_sep_ok and ema50_falling and dipped_short and rip_short and rsi_ok_short and _di_gap_short and not _dump_extended:
+        if strong_downtrend and spike_ok_cont and bias_short and ema_sep_ok and ema50_falling and dipped_short and rip_short and rsi_ok_short and _di_gap_short and not _dump_extended and not _spike_blocks_short:
             self._last_signal_was_continuation = True
             self._last_signal_was_exhaustion_reversal = False
             self._last_signal_was_di_snap = False
@@ -470,6 +485,8 @@ class ScalpingStrategy:
             and rsi_ok_short
             and not _dump_extended
         )
+        # Disable it temporarily.
+        _grind_short = False
         if _grind_short:
             self._last_signal_was_continuation = False
             self._last_signal_was_exhaustion_reversal = False
