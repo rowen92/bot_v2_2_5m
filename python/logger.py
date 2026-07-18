@@ -110,11 +110,12 @@ def setup_logging() -> None:
 _trade_log = logging.getLogger("trade")
 
 
-def log_open(side: str, entry: float, qty: float, tp: float, sl: float, mode: str, regime: str = "") -> None:
+def log_open(side: str, entry: float, qty: float, tp: float, sl: float, mode: str, regime: str = "", signal: str = "") -> None:
     regime_str = f"  regime={regime}" if regime else ""
+    signal_str = f"  signal={signal}" if signal else ""
     _trade_log.info(
         f"OPEN  side={side.upper()}  entry={entry:.4f}  qty={qty}  "
-        f"sl={sl:.4f}  mode={mode}{regime_str}"
+        f"sl={sl:.4f}  mode={mode}{regime_str}{signal_str}"
     )
 
 

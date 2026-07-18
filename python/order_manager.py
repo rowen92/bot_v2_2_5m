@@ -115,7 +115,7 @@ class OrderManager:
             # exhaustion_armed uses trail exit only (no flat TP) — mirrors backtest.py
             # tp1_price stays 0.0 (default) so the exit block falls through to trail
             state.position = pos
-            tlog.log_open(signal, entry, qty, tp, sl, cfg.TRADING_MODE, regime=regime)
+            tlog.log_open(signal, entry, qty, tp, sl, cfg.TRADING_MODE, regime=regime, signal=pos.signal_type)
 
         return pos
 
