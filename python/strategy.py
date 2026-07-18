@@ -279,25 +279,12 @@ class ScalpingStrategy:
                 self._spike_active = False  # Price escaped the spike block, unlock immediately
                 log.debug(f"SPIKE BOUNDARY CLEARED  close={close:.4f} broke range {self._spike_low:.4f}-{self._spike_high:.4f}")
             else:
-                # Still inside the box — only block entries against the spike direction.
-                # With-trend entries (short after down spike, long after up spike) are allowed.
-                _blocked_long  = self._spike_direction == "down"
-                _blocked_short = self._spike_direction == "up"
                 log.debug(
                     f"SPIKE BOUNDARY ACTIVE  close={close:.4f} inside {self._spike_low:.4f}-{self._spike_high:.4f}"
-                    f"  blocks={'long' if _blocked_long else 'short'}"
+                    f"  blocks={'long' if self._spike_direction == 'down' else 'short'}"
                 )
-                # Store which side is blocked so signal checks below can use it.
-                # We don't return "none" here — signal logic will filter via _spike_active flags.
-        elif self._spike_direction != "none":
-            _ema_sep_local = abs(ema_fast - ema_trend)
-            _is_strong_trend = row["adx"] >= 50 and _ema_sep_local >= 1.5 * atr_val
-            if self._spike_direction == "down" and in_downtrend:
-                if not _is_strong_trend:
-                    self._spike_direction = "none"
-            if self._spike_direction == "up" and in_uptrend:
-                if not _is_strong_trend:
-                    self._spike_direction = "none"
+        if not self._spike_active and self._spike_direction != "none":
+            # Stale direction after boundary cleared — reset.
             self._spike_direction = "none"
 
         # Counter-spike guard: block entries opposite to the spike direction.
