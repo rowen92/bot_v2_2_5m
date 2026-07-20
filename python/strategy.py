@@ -344,7 +344,13 @@ class ScalpingStrategy:
         _short_candle_ok     = (not _deep_bear_waterfall) or _bearish_candle
         _long_candle_ok      = (not _deep_bull_waterfall) or _bullish_candle
 
-        if self._short_armed and self._exhaustion_sl_lockout == 0 and vol_ok and in_uptrend and ema_sep_ok and close > ema_slow and ema50_rising and _di_balanced_short and _short_candle_ok and rsi_ok_short and not _spike_blocks_short:
+        # Guards against premature exhaustion short:
+        # 1. plus_di must have been leading (real uptrend exhaustion, not sideways chop)
+        # 2. EMA8 must be meaningfully above EMA21 (not just a noise cross)
+        _exh_short_ema_gap_ok = (ema_fast - ema_slow) >= 0.5 * atr_val
+        _exh_short_bulls_led  = _plus_di > _minus_di  # bulls were actually dominant
+
+        if self._short_armed and self._exhaustion_sl_lockout == 0 and vol_ok and in_uptrend and ema_sep_ok and _exh_short_ema_gap_ok and _exh_short_bulls_led and close > ema_slow and ema50_rising and _di_balanced_short and _short_candle_ok and rsi_ok_short and not _spike_blocks_short:
             self._short_armed = False
             self._short_armed_remaining = 0
             self._last_signal_was_continuation = False
@@ -356,7 +362,11 @@ class ScalpingStrategy:
         _di_balanced_long = _minus_di < _plus_di * 2.0
         _bulls_leading = _plus_di > _minus_di
 
-        if self._long_armed and self._exhaustion_sl_lockout == 0 and vol_ok and in_downtrend and ema_sep_ok and close < ema_slow and ema50_falling and _di_balanced_long and _bulls_leading and _long_candle_ok and rsi_ok_long and not _spike_blocks_long:
+        # Symmetric guards for exhaustion long
+        _exh_long_ema_gap_ok = (ema_slow - ema_fast) >= 0.5 * atr_val
+        _exh_long_bears_led  = _minus_di > _plus_di  # bears were actually dominant
+
+        if self._long_armed and self._exhaustion_sl_lockout == 0 and vol_ok and in_downtrend and ema_sep_ok and _exh_long_ema_gap_ok and _exh_long_bears_led and close < ema_slow and ema50_falling and _di_balanced_long and _bulls_leading and _long_candle_ok and rsi_ok_long and not _spike_blocks_long:
             self._long_armed = False
             self._long_armed_remaining = 0
             self._last_signal_was_continuation = False
@@ -416,7 +426,7 @@ class ScalpingStrategy:
             and not _spike_blocks_short
         ):
             _snap_sl = close + 1.0 * atr_val
-            _snap_tp = min(float(ema_slow), close - 1.5 * atr_val)
+            _snap_tp = max(float(ema_slow), close - 1.5 * atr_val)
             self._last_signal_was_continuation = False
             self._last_signal_was_exhaustion_reversal = True
             self._last_signal_was_di_snap = True
@@ -507,12 +517,17 @@ class ScalpingStrategy:
         if self._exhaustion_sl_lockout > 0:
             self._exhaustion_sl_lockout -= 1
         else:
-            if _exh_adx_peaked_falling and in_uptrend and _adx_n3 >= _EXHAUSTION_ADX_FLOOR:
+            # Only arm short exhaustion if plus_di was actually leading at the ADX peak —
+            # prevents arming when the "uptrend" is just a noise EMA cross with bears dominant
+            _arm_short_di_ok = df["plus_di"].iloc[-1 - ADX_SLOPE_BARS] > df["minus_di"].iloc[-1 - ADX_SLOPE_BARS]
+            if _exh_adx_peaked_falling and in_uptrend and _adx_n3 >= _EXHAUSTION_ADX_FLOOR and _arm_short_di_ok:
                 self._short_armed = True
                 self._short_armed_remaining = _EXHAUSTION_ARM_WINDOW
                 self._long_armed = False
 
-            if _exh_adx_peaked_falling and in_downtrend and _adx_n3 >= _EXHAUSTION_ADX_FLOOR:
+            # Only arm long exhaustion if minus_di was actually leading at the ADX peak
+            _arm_long_di_ok = df["minus_di"].iloc[-1 - ADX_SLOPE_BARS] > df["plus_di"].iloc[-1 - ADX_SLOPE_BARS]
+            if _exh_adx_peaked_falling and in_downtrend and _adx_n3 >= _EXHAUSTION_ADX_FLOOR and _arm_long_di_ok:
                 self._long_armed = True
                 self._long_armed_remaining = _EXHAUSTION_ARM_WINDOW
                 self._short_armed = False

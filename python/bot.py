@@ -2,6 +2,7 @@ import asyncio
 import logging
 import sys
 import os
+import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -21,13 +22,77 @@ risk     = RiskManager()
 
 
 # ---------------------------------------------------------------------------
-# CANDLE CALLBACK  - fires once per closed 1m candle
+# CANDLE CALLBACK  - fires once per closed 5m candle
 # ---------------------------------------------------------------------------
 
 async def on_closed_candle(state: State, client: AsyncClient) -> None:
     # Fetch OI via REST on every closed candle — this is the only reliable
     # source of OI data on Binance Futures (not available in any WS stream)
     await fetch_open_interest(client, state)
+
+    # ── Position sync guard ───────────────────────────────────────────────────
+    # Catches state desync in three scenarios:
+    #   1. Bot crash/restart — Binance crash-SL (3× dist) fired while bot was down
+    #   2. Manual close on Binance UI while bot is running
+    #   3. Liquidation — Binance force-closed, Python unaware
+    # Runs once per 5m candle (cheap: one REST call only when position is open).
+    if state.position is not None and not cfg.is_paper():
+        try:
+            positions = await client.futures_position_information(symbol=cfg.SYMBOL)
+            actual_amt = 0.0
+            for p in positions:
+                if p.get("symbol") == cfg.SYMBOL:
+                    actual_amt = abs(float(p.get("positionAmt", 0.0)))
+                    break
+            if actual_amt == 0.0:
+                pos = state.position
+                # ── Recover real exit price from Binance trade history ────────
+                # The position was closed externally (TP bracket, crash-SL, manual,
+                # or liquidation). Fetch the last fill so we log accurate PnL and
+                # apply the correct post-trade treatment (TP vs SL cooldown/blocks).
+                real_exit    = state.mark_price  # fallback if REST call fails
+                close_reason = "sl"              # conservative fallback
+                try:
+                    trades = await client.futures_account_trades(
+                        symbol=cfg.SYMBOL, limit=5
+                    )
+                    if trades:
+                        last = sorted(trades, key=lambda t: t["time"], reverse=True)[0]
+                        real_exit = float(last.get("price", real_exit))
+                        _sign = risk.calc_pnl(pos.entry_price, real_exit, pos.qty, pos.side)
+                        close_reason = "tp" if _sign > 0 else "sl"
+                except Exception as exc:
+                    log.warning(f"Position sync: could not fetch trade history: {exc}")
+
+                real_pnl = risk.calc_pnl(pos.entry_price, real_exit, pos.qty, pos.side)
+                log.warning(
+                    f"Position sync: Binance shows no open position but state has "
+                    f"{pos.side.upper()} entry={pos.entry_price:.4f} qty={pos.qty} — "
+                    f"closed externally. exit={real_exit:.4f}  pnl={real_pnl:+.4f}  "
+                    f"reason={close_reason}. Clearing state."
+                )
+                # Refresh balance so log_close shows the post-trade value
+                fresh_balance = await orders._live_balance(client)
+                if fresh_balance > 0:
+                    state.live_balance_snapshot = fresh_balance
+                tlog.log_close(
+                    pos.side, pos.entry_price, real_exit,
+                    pos.qty, real_pnl, close_reason, cfg.TRADING_MODE,
+                    state.live_balance_snapshot,
+                    pos.open_time,
+                )
+                state.record_pnl(real_pnl)
+                state.last_close_reason = close_reason
+                state.last_close_ts = time.time()
+                if close_reason == "sl":
+                    state.last_sl_entry_price = pos.entry_price
+                    state.last_sl_atr          = pos.atr or 0.0
+                    state.last_sl_side         = pos.side
+                state.position = None
+                tlog.log_daily_stats(state)
+        except Exception as exc:
+            log.warning(f"Position sync check failed: {exc}")
+    # ─────────────────────────────────────────────────────────────────────────
 
     indicators = strategy.indicator_snapshot(state)
     if not indicators:
@@ -127,9 +192,16 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
 async def on_tick(state: State, client: AsyncClient) -> None:
     had_position = state.position is not None
     await orders.maybe_exit(state, client)
-    # Refresh live balance snapshot after a position closes (live mode only)
-    if had_position and state.position is None and not cfg.is_paper():
-        state.live_balance_snapshot = await orders._live_balance(client)
+    # After a position closes on this tick
+    if had_position and state.position is None:
+        # Cancel exhaustion arms on SL — mirrors backtest.py line 480.
+        # Must happen here (on_tick) not on_closed_candle, because the next
+        # mark-price tick could fire an exhaustion entry before the candle closes.
+        if state.last_close_reason == "sl":
+            strategy.cancel_exhaustion_arms()
+        # Refresh live balance snapshot (live mode only)
+        if not cfg.is_paper():
+            state.live_balance_snapshot = await orders._live_balance(client)
 
 
 # ---------------------------------------------------------------------------

@@ -67,6 +67,8 @@ class Config:
     CHOP_SL_MULT:        float = _float('CHOP_SL_MULT',        1.0)
     TREND_SL_MULT:       float = _float('TREND_SL_MULT',       2.0)
     STRONG_TREND_SL_MULT: float = _float('STRONG_TREND_SL_MULT', 2.5)
+    # Continuation signals fire during ATR compression — wider SL to survive wick retests
+    CONTINUATION_SL_MULT: float = _float('CONTINUATION_SL_MULT', 3.5)
 
     # Block all new entries when market_regime == CHOP (ADX < 45, weak momentum).
     # Set CHOP_BLOCK=false in .env to re-enable per-bot if needed.

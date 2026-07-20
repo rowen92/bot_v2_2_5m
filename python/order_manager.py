@@ -58,9 +58,18 @@ class OrderManager:
 
         # DI-snap entries use ATR-based SL + fixed TP at 2R (mirrors backtest.py).
         # All other entries use ATR-based SL + trail (no fixed TP).
-        is_di_snap    = strategy is not None and strategy.was_di_snap()
-        is_grind_short = strategy is not None and strategy.was_grind_short()
-        sl = rm.sl_price(entry, signal, atr=atr, regime=regime)
+        is_di_snap      = strategy is not None and strategy.was_di_snap()
+        is_grind_short  = strategy is not None and strategy.was_grind_short()
+        is_continuation = strategy is not None and strategy.was_continuation()
+        is_exhaustion   = strategy is not None and strategy.was_exhaustion_reversal()
+        # sig_type drives sl_price() multiplier — exhaustion uses regime SL (same as cross)
+        sig_type = (
+            "di_snap"      if is_di_snap else
+            "continuation" if is_continuation else
+            "grind_short"  if is_grind_short else
+            "cross"        # exhaustion + cross both use regime-based SL mult
+        )
+        sl = rm.sl_price(entry, signal, atr=atr, regime=regime, signal_type=sig_type)
 
         # Grind short = slot blocker only. Override qty to minimum and SL to
         # 0.5×ATR so it always zombies out cheaply. Mirrors backtest.py logic.
@@ -87,7 +96,7 @@ class OrderManager:
         else:
             pos = await self._live_open(signal, entry, qty, tp, sl, client)
 
-        is_exhaustion_armed = strategy is not None and strategy.was_exhaustion_reversal() and not is_di_snap
+        is_exhaustion_armed = is_exhaustion and not is_di_snap
 
         if pos:
             pos.best_price          = entry    # initialise trailing high-water-mark
@@ -98,11 +107,11 @@ class OrderManager:
             # Continuations use 1.5R, all others use 2.0R (mirrors backtest.py).
             if is_di_snap:
                 pos.signal_type = "di_snap"
-            elif strategy is not None and strategy.was_exhaustion_reversal():
+            elif is_exhaustion:
                 pos.signal_type = "exhaustion_armed"
             elif is_grind_short:
                 pos.signal_type = "grind_short"
-            elif strategy is not None and strategy.was_continuation():
+            elif is_continuation:
                 pos.signal_type = "continuation"
             else:
                 pos.signal_type = "cross"
@@ -160,6 +169,11 @@ class OrderManager:
             # so state.paper_balance now reflects the settled post-trade balance.
             display_balance = state.paper_balance
         else:
+            # Fetch fresh balance from Binance so the logged value reflects the
+            # actual post-trade account balance, not the stale pre-close snapshot.
+            fresh_balance = await self._live_balance(client)
+            if fresh_balance > 0:
+                state.live_balance_snapshot = fresh_balance
             display_balance = state.live_balance_snapshot
 
         tlog.log_close(
@@ -388,34 +402,58 @@ class OrderManager:
             return None   # nothing was placed — safe to return
 
         # Entry is now LIVE. Guard every subsequent call so we never leave a naked position.
-        try:
-            # 2. Take-profit order
-            await client.futures_create_order(
-                symbol=symbol,
-                side=close_side,
-                type="TAKE_PROFIT_MARKET",
-                stopPrice=round(tp, cfg.PRICE_PRECISION),
-                closePosition=True,
-                timeInForce="GTE_GTC",
-            )
-        except Exception as exc:
-            log.error(f"live_open TP placement failed — emergency close: {exc}")
-            await OrderManager._emergency_close(client, symbol, close_side, qty)
-            return None
+
+        # TP bracket — di_snap only (tp > 0). Other signals use trail exit.
+        # Uses futures_create_algo_order (python-binance >= 1.0.36) which calls
+        # /fapi/v1/algoOrder directly. On failure: log and continue, trail handles exit.
+        if tp > 0:
+            try:
+                await client.futures_create_algo_order(
+                    symbol=symbol,
+                    side=close_side,
+                    type="TAKE_PROFIT_MARKET",
+                    algoType="CONDITIONAL",
+                    triggerPrice=round(tp, cfg.PRICE_PRECISION),
+                    quantity=qty,
+                    reduceOnly=True,
+                )
+            except Exception as exc:
+                log.error(f"live_open TP placement failed — trail will handle exit: {exc}")
 
         try:
-            # 3. Stop-loss order
-            await client.futures_create_order(
+            # SL bracket — crash-protection ONLY (in case bot process dies).
+            # Placed at 2× the Python SL distance — far enough to not interfere
+            # with normal wicks or the candle-close Python SL, but inside
+            # liquidation distance (~20% at 5× leverage).
+            # Hard cap at 8% from entry: continuation signals have sl_dist=3.5×ATR
+            # which at 3× would push past liquidation — cap prevents that.
+            sl_dist = abs(sl - actual_entry)
+            raw_crash_dist = sl_dist * 2
+            max_crash_dist = actual_entry * 0.08   # 8% hard cap — inside liq at 5× leverage
+            crash_dist = min(raw_crash_dist, max_crash_dist)
+            crash_sl = (
+                actual_entry - crash_dist if signal == "long"
+                else actual_entry + crash_dist
+            )
+            await client.futures_create_algo_order(
                 symbol=symbol,
                 side=close_side,
                 type="STOP_MARKET",
-                stopPrice=round(sl, cfg.PRICE_PRECISION),
-                closePosition=True,
-                timeInForce="GTE_GTC",
+                algoType="CONDITIONAL",
+                triggerPrice=round(crash_sl, cfg.PRICE_PRECISION),
+                quantity=qty,
+                reduceOnly=True,
             )
         except Exception as exc:
             log.error(f"live_open SL placement failed — emergency close: {exc}")
             await client.futures_cancel_all_open_orders(symbol=symbol)
+            # Also cancel any algo orders (e.g. TP placed above for di_snap)
+            try:
+                algo_orders = await client.futures_get_open_algo_orders(symbol=symbol)
+                for o in algo_orders:
+                    await client.futures_cancel_algo_order(symbol=symbol, algoId=o["algoId"])
+            except Exception:
+                pass
             await OrderManager._emergency_close(client, symbol, close_side, qty)
             return None
 
@@ -437,13 +475,13 @@ class OrderManager:
         """
         close_side = "SELL" if pos.side == "long" else "BUY"
         try:
-            # Cancel any open TP/SL orders first
-            await client.futures_cancel_all_open_orders(symbol=cfg.SYMBOL)
-
-            # ── Race-condition guard ──────────────────────────────────────────
-            # Binance may have already filled our static TP/SL order at the same
-            # moment Python's trail fired. Check the real position size before
-            # sending a market close to avoid opening an unintended reverse position.
+            # ── Race-condition guard (FIRST) ──────────────────────────────────
+            # Check actual position size on Binance BEFORE cancelling orders or
+            # placing a close. The TP/SL bracket algo may have already been filled
+            # by Binance (e.g. while WS was down). In that case the position is
+            # already flat and a reduceOnly market order would be rejected (-2022).
+            # Must come first: if futures_cancel_all_open_orders throws on a flaky
+            # network, we would jump to the outer except and skip this check entirely.
             actual_qty = pos.qty
             try:
                 positions = await client.futures_position_information(symbol=cfg.SYMBOL)
@@ -456,14 +494,28 @@ class OrderManager:
 
             if actual_qty == 0:
                 log.warning(
-                    "live_close: position already closed on Binance (TP/SL filled first) — "
+                    "live_close: position already closed on Binance (TP/SL bracket filled) — "
                     "skipping duplicate market order"
                 )
-                # Best-effort PnL estimate using the mark price we have
+                # Return best-effort PnL; the sync block in bot.py will fetch the
+                # real fill price on the next candle and log it accurately.
                 return rm.calc_pnl(pos.entry_price, exit_price, pos.qty, pos.side)
             # ─────────────────────────────────────────────────────────────────
 
-            # Market close
+            # Cancel standard orders first
+            await client.futures_cancel_all_open_orders(symbol=cfg.SYMBOL)
+            # Also cancel algo orders (SL/TP placed via /fapi/v1/algoOrder).
+            # Standard cancel-all does NOT cancel algo orders on Binance.
+            try:
+                algo_orders = await client.futures_get_open_algo_orders(symbol=cfg.SYMBOL)
+                for o in algo_orders:
+                    await client.futures_cancel_algo_order(
+                        symbol=cfg.SYMBOL, algoId=o["algoId"]
+                    )
+            except Exception as exc:
+                log.warning(f"live_close: algo order cancel failed (may already be filled): {exc}")
+
+            # Market close — reduceOnly ensures we never flip into a reverse position
             resp = await client.futures_create_order(
                 symbol=cfg.SYMBOL,
                 side=close_side,

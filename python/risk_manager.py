@@ -196,10 +196,12 @@ class RiskManager:
         # do NOT multiply here or the position becomes leverage× too large.
         qty = risk_usdt / sl_distance
 
-        # Leverage cap — prevents oversized positions relative to account balance.
-        # Mirrors backtest.py calc_qty() behaviour.
-        max_notional = balance * cfg.LEVERAGE
-        max_qty = max_notional / entry_price
+        # Leverage cap — cap margin usage at 90% of balance.
+        # Leaves 10% free for fees, bracket order margin, and funding.
+        # Binance rejects with -2019 when margin usage hits 100% (Hedge Mode
+        # locks margin for TP/SL bracket orders on top of the position margin).
+        max_notional = balance * cfg.LEVERAGE * 0.90
+        max_qty      = max_notional / entry_price
         qty = min(qty, max_qty)
 
         # Round down to nearest QTY_STEP (configured per symbol in .env).
@@ -216,15 +218,20 @@ class RiskManager:
 
     # ── SL price level ────────────────────────────────────────────────────────
 
-    def sl_price(self, entry: float, side: str, atr: float | None = None, regime: str = "TREND") -> float:
+    def sl_price(self, entry: float, side: str, atr: float | None = None, regime: str = "TREND", signal_type: str = "") -> float:
         """
         Stop-loss price.  Uses ATR-based distance (sl_mult × ATR) when
         available, where sl_mult is chosen by market regime.
+        Continuation signals get a wider multiplier (CONTINUATION_SL_MULT) because
+        they fire during ATR compression and need extra room to survive wick retests.
         Falls back to fixed STOP_LOSS_PCT otherwise.
         """
         if atr and atr > 0:
-            sl_mult = self.regime_params(regime)["sl"]
-            dist    = atr * sl_mult
+            if signal_type == "continuation":
+                sl_mult = cfg.CONTINUATION_SL_MULT
+            else:
+                sl_mult = self.regime_params(regime)["sl"]
+            dist = atr * sl_mult
         else:
             dist = entry * (cfg.STOP_LOSS_PCT / 100)
         return entry - dist if side == "long" else entry + dist
