@@ -350,7 +350,9 @@ class ScalpingStrategy:
         _exh_short_ema_gap_ok = (ema_fast - ema_slow) >= 0.5 * atr_val
         _exh_short_bulls_led  = _plus_di > _minus_di  # bulls were actually dominant
 
-        if self._short_armed and self._exhaustion_sl_lockout == 0 and vol_ok and in_uptrend and ema_sep_ok and _exh_short_ema_gap_ok and _exh_short_bulls_led and close > ema_slow and ema50_rising and _di_balanced_short and _short_candle_ok and rsi_ok_short and not _spike_blocks_short:
+        _adx_still_falling = (len(df) >= 2) and (row["adx"] < df["adx"].iloc[-2])
+
+        if self._short_armed and self._exhaustion_sl_lockout == 0 and _adx_still_falling and vol_ok and in_uptrend and ema_sep_ok and _exh_short_ema_gap_ok and _exh_short_bulls_led and close > ema_slow and ema50_rising and _di_balanced_short and _short_candle_ok and rsi_ok_short and not _spike_blocks_short:
             self._short_armed = False
             self._short_armed_remaining = 0
             self._last_signal_was_continuation = False
@@ -366,7 +368,7 @@ class ScalpingStrategy:
         _exh_long_ema_gap_ok = (ema_slow - ema_fast) >= 0.5 * atr_val
         _exh_long_bears_led  = _minus_di > _plus_di  # bears were actually dominant
 
-        if self._long_armed and self._exhaustion_sl_lockout == 0 and vol_ok and in_downtrend and ema_sep_ok and _exh_long_ema_gap_ok and _exh_long_bears_led and close < ema_slow and ema50_falling and _di_balanced_long and _bulls_leading and _long_candle_ok and rsi_ok_long and not _spike_blocks_long:
+        if self._long_armed and False and self._exhaustion_sl_lockout == 0 and _adx_still_falling and vol_ok and in_downtrend and ema_sep_ok and _exh_long_ema_gap_ok and _exh_long_bears_led and close < ema_slow and ema50_falling and _di_balanced_long and _bulls_leading and _long_candle_ok and rsi_ok_long and not _spike_blocks_long:
             self._long_armed = False
             self._long_armed_remaining = 0
             self._last_signal_was_continuation = False
@@ -403,6 +405,7 @@ class ScalpingStrategy:
             and ema50_falling
             and _di_balanced_long
             and not _spike_blocks_long
+            and False
         ):
             _snap_sl = close - 1.0 * atr_val
             _snap_tp = max(float(ema_slow), close + 1.5 * atr_val)
@@ -424,6 +427,7 @@ class ScalpingStrategy:
             and ema50_rising
             and _di_balanced_short
             and not _spike_blocks_short
+            and False
         ):
             _snap_sl = close + 1.0 * atr_val
             _snap_tp = max(float(ema_slow), close - 1.5 * atr_val)
@@ -533,11 +537,13 @@ class ScalpingStrategy:
                 self._short_armed = False
 
             if self._short_armed and self._short_armed_remaining < _EXHAUSTION_ARM_WINDOW:
-                self._short_armed_remaining -= 1
+                if not _spike_blocks_short:
+                    self._short_armed_remaining -= 1
                 if self._short_armed_remaining <= 0:
                     self._short_armed = False
             if self._long_armed and self._long_armed_remaining < _EXHAUSTION_ARM_WINDOW:
-                self._long_armed_remaining -= 1
+                if not _spike_blocks_long:
+                    self._long_armed_remaining -= 1
                 if self._long_armed_remaining <= 0:
                     self._long_armed = False
 

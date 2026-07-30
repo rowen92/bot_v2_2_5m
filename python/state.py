@@ -73,6 +73,14 @@ class Position:
     # so the exact breakeven price is used instead of the current mark_price tick.
     zombie_exit_price:    float = 0.0
 
+    # Resting limit order ID for zombie scratch — non-empty means the limit order
+    # is live on Binance and we are waiting for it to fill before clearing state.
+    zombie_limit_order_id: str = ""
+
+    # Resting LIMIT GTC order ID for fixed-TP signals (di_snap, exhaustion_armed).
+    # Non-empty means the TP limit is live on Binance; maybe_exit polls it for fill.
+    tp_limit_order_id: str = ""
+
     # Legacy stubs — keep so any stale state.json fields deserialise without error
     tp2_price:            float = 0.0
     tp1_done:             bool  = False
