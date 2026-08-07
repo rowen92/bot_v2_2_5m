@@ -35,7 +35,7 @@ EMA_FAST      = 8
 EMA_SLOW      = 21
 EMA_TREND     = 50
 ADX_PERIOD    = 14
-ADX_MIN       = 25.0
+ADX_MIN       = 30.0
 ADX_TREND_MIN = 45.0
 ADX_SLOPE_BARS = 3
 ADX_STRONG     = 45.0
@@ -78,6 +78,10 @@ class ScalpingStrategy:
         self._long_armed_remaining: int = 0
         self._exhaustion_sl_lockout: int = 0
         self._last_signal_was_grind_short: bool = False
+        self._last_signal_was_macro_cross: bool = False
+        self._di_squeeze_bulls_dominant: bool = False
+        self._di_squeeze_bears_dominant: bool = False
+        self._last_signal_was_di_squeeze: bool = False
 
     def cancel_exhaustion_arms(self, lockout_candles: int = 6) -> None:
         log.debug(
@@ -102,6 +106,12 @@ class ScalpingStrategy:
     def was_grind_short(self) -> bool:
         return self._last_signal_was_grind_short
 
+    def was_macro_cross(self) -> bool:
+        return self._last_signal_was_macro_cross
+
+    def was_di_squeeze(self) -> bool:
+        return self._last_signal_was_di_squeeze
+
     def di_snap_levels(self) -> dict:
         return self._di_snap_levels
 
@@ -123,14 +133,15 @@ class ScalpingStrategy:
             "ema_fast":  round(row["ema_fast"],  cfg.PRICE_PRECISION),
             "ema_slow":  round(row["ema_slow"],  cfg.PRICE_PRECISION),
             "ema_trend": round(row["ema_trend"], cfg.PRICE_PRECISION),
-            "adx":       round(row["adx"],       2),
-            "plus_di":   round(row["plus_di"],   2),
-            "minus_di":  round(row["minus_di"],  2),
+            "adx":       round(row["adx"],       4),
+            "plus_di":   round(row["plus_di"],   4),
+            "minus_di":  round(row["minus_di"],  4),
             "atr":       round(row["atr"],       cfg.PRICE_PRECISION + 1),
             "rsi":       round(row["rsi"],       2),
             "volume":    round(row["volume"],    2),
             "vol_avg":   round(row["vol_avg"],   2),
             "cross":     row["cross"],
+            "macro_cross": row["macro_cross"],
             "close":     round(row["close"], cfg.PRICE_PRECISION),
         }
 
@@ -174,7 +185,16 @@ class ScalpingStrategy:
         else:
             adx_rising = True
 
-        adx_ok       = (row["adx"] >= ADX_MIN)       and adx_rising
+        # ── ATR expansion guard (cross-only) ─────────────────────────────────
+        # ATR at entry candle must be higher than ATR 3 candles back.
+        # e.g. entry at 15:45 → candle at 15:30 (iloc[-4]) must be lower.
+        if len(df) >= 4:
+            _atr_rising = row["atr"] > df["atr"].iloc[-4]
+        else:
+            _atr_rising = True
+        # ─────────────────────────────────────────────────────────────────────
+
+        adx_ok       = row["adx"] >= ADX_MIN
         adx_trend_ok = (row["adx"] >= ADX_TREND_MIN) and adx_rising
         vol_ok       = row["volume"]       >= row["vol_avg"] * VOL_MULT
 
@@ -199,7 +219,7 @@ class ScalpingStrategy:
             _pump_extended = _dump_extended = False
 
         _adx_for_window = row["adx"]
-        _CROSS_WINDOW = 3
+        _CROSS_WINDOW = 2
         ema_fast_now = row["ema_fast"]
         ema_slow_now = row["ema_slow"]
         if cross in ("bull", "bear"):
@@ -241,7 +261,7 @@ class ScalpingStrategy:
         ema_gap_ok_short = PULLBACK_MIN_ATR * atr_val < (ema_slow - close) <= PULLBACK_MAX_ATR * atr_val
 
         # --- OPTIMIZATION 4: ATR Shrink Trap Fix (Absolute Floor Separation) ---
-        _ema_sep = abs(ema_fast - ema_trend)
+        _ema_sep = abs(ema_fast - ema_slow)
         _abs_min_sep = close * 0.001 # 0.1% of absolute price minimum guard
         ema_sep_ok       = _ema_sep >= max(0.5 * atr_val, _abs_min_sep)
         ema_sep_ok_cross = _ema_sep >= max(0.1 * atr_val, _abs_min_sep * 0.2)
@@ -304,10 +324,61 @@ class ScalpingStrategy:
         # ---------------------------------------------------------------
 
         # ── 1. Crossover entries (fresh cross signal) ─────────────────────────
-        if cross == "bull" and adx_ok and vol_waking_up and spike_ok and in_uptrend and bias_long and ema_gap_ok_long and ema_sep_ok_cross and rsi_ok_long and not _spike_blocks_long:
+        # MACRO TREND: Ensure the 8 EMA and 21 EMA have real separation
+        _macro_trend_ok = abs(ema_fast - ema_slow) >= (atr_val * 0.2)
+
+        # ── DI cross recency guard ────────────────────────────────────────────
+        # Block if DI crossed within 3 candles (15 min) before entry.
+        # To detect a cross at iloc[-4] we must check iloc[-5] (the candle
+        # before it). Near-cross: abs(+DI - -DI) / max(+DI, -DI) <= 10%.
+        def _di_near_cross(p, m):
+            return abs(p - m) <= 5.0
+
+        if len(df) >= 7:
+            _p2, _m2 = df["plus_di"].iloc[-2], df["minus_di"].iloc[-2]
+            _p3, _m3 = df["plus_di"].iloc[-3], df["minus_di"].iloc[-3]
+            _p4, _m4 = df["plus_di"].iloc[-4], df["minus_di"].iloc[-4]
+#             _p5, _m5 = df["plus_di"].iloc[-5], df["minus_di"].iloc[-5]
+#             _p6, _m6 = df["plus_di"].iloc[-6], df["minus_di"].iloc[-6]
+            _di_bull_too_recent = (
+                _p2 < _m2 or _di_near_cross(_p2, _m2)
+                or _p3 < _m3 or _di_near_cross(_p3, _m3)
+                or _p4 < _m4 or _di_near_cross(_p4, _m4)
+#                 or _p5 < _m5 or _di_near_cross(_p5, _m5)
+#                 or _p6 < _m6 or _di_near_cross(_p6, _m6)
+            )
+            _di_bear_too_recent = (
+                _p2 > _m2 or _di_near_cross(_p2, _m2)
+                or _p3 > _m3 or _di_near_cross(_p3, _m3)
+                or _p4 > _m4 or _di_near_cross(_p4, _m4)
+#                 or _p5 > _m5 or _di_near_cross(_p5, _m5)
+#                 or _p6 > _m6 or _di_near_cross(_p6, _m6)
+            )
+        else:
+            _di_bull_too_recent = False
+            _di_bear_too_recent = False
+
+        if (
+            cross == "bull"
+#             and adx_ok
+#             and vol_ok
+#             and spike_ok
+#             and in_uptrend
+#             and not _spike_blocks_long
+            and _macro_trend_ok                     # Ensure 8/21 EMA have real separation
+#             and close > ema_trend                   # Bias: price above 50 EMA
+#             and ema50_rising                        # Bias: 50 EMA pointing up
+#             and row["plus_di"] > row["minus_di"]    # DMI: Bulls in control
+#             and rsi_val <= 55.0                     # RSI Cap: Don't buy the top
+#             and ema_sep_ok_cross                    # Filter fake micro-crosses
+            and _atr_rising                         # ATR net expansion + not peaked
+            and not _di_bull_too_recent             # DI cross must be >= 3 bars old
+            and not _pump_extended                  # Price hasn't run > 2x ATR over last 4 bars
+            and False
+        ):
             _pb_dist = (close - ema_slow) / atr_val
             log.info(
-                f"SIGNAL long  |  cross=bull  adx={row['adx']:.1f}  "
+                f"SIGNAL long  |  cross=bull  adx={row['adx']:.1f}  dx={row['dx']:.1f}  "
                 f"vol={row['volume']:.0f}  ema50={ema_trend:.4f}  close={close:.4f}  "
                 f"pullback={_pb_dist:.2f}x ATR from EMA21"
             )
@@ -318,7 +389,23 @@ class ScalpingStrategy:
             self._long_armed = False
             return "long"
 
-        if cross == "bear" and adx_ok and vol_waking_up and spike_ok and in_downtrend and bias_short and ema_gap_ok_short and ema_sep_ok_cross and rsi_ok_short and not _spike_blocks_short:
+        if (
+            cross == "bear"
+#             and adx_ok
+#             and vol_ok
+#             and spike_ok
+#             and in_downtrend
+#             and not _spike_blocks_short
+            and _macro_trend_ok                     # Ensure 8/21 EMA have real separation
+#             and close < ema_trend                   # Bias: price below 50 EMA
+#             and ema50_falling                       # Bias: 50 EMA pointing down
+#             and row["minus_di"] > row["plus_di"]    # DMI: Bears in control
+#             and rsi_val >= 45.0                     # RSI Cap: Don't short the bottom
+#             and ema_sep_ok_cross                    # Filter fake micro-crosses
+            and _atr_rising                         # ATR net expansion + not peaked
+            and not _di_bear_too_recent             # DI cross must be >= 3 bars old
+            and False
+        ):
             _pb_dist = (ema_slow - close) / atr_val
             log.info(
                 f"SIGNAL short |  cross=bear  adx={row['adx']:.1f}  "
@@ -331,6 +418,130 @@ class ScalpingStrategy:
             self._last_signal_was_grind_short = False
             self._short_armed = False
             return "short"
+
+        # ── 1a. EMA21/50 macro cross entries ─────────────────────────────────
+        _macro_cross = row["macro_cross"]
+
+        if (
+            _macro_cross == "bull"
+            and row["plus_di"] > row["minus_di"]
+            and _atr_rising
+            and _macro_trend_ok
+            and False
+        ):
+            log.info(
+                f"SIGNAL long  |  macro_cross=bull  adx={row['adx']:.1f}"
+                f"  plus_di={row['plus_di']:.2f}  minus_di={row['minus_di']:.2f}"
+                f"  close={close:.4f}"
+            )
+            self._last_signal_was_continuation = False
+            self._last_signal_was_exhaustion_reversal = False
+            self._last_signal_was_di_snap = False
+            self._last_signal_was_grind_short = False
+            self._last_signal_was_macro_cross = True
+            return "long"
+
+        if (
+            _macro_cross == "bear"
+            and row["minus_di"] > row["plus_di"]
+            and _atr_rising
+            and _macro_trend_ok
+            and False
+        ):
+            log.info(
+                f"SIGNAL short |  macro_cross=bear  adx={row['adx']:.1f}"
+                f"  plus_di={row['plus_di']:.2f}  minus_di={row['minus_di']:.2f}"
+                f"  close={close:.4f}"
+            )
+            self._last_signal_was_continuation = False
+            self._last_signal_was_exhaustion_reversal = False
+            self._last_signal_was_di_snap = False
+            self._last_signal_was_grind_short = False
+            self._last_signal_was_macro_cross = True
+            return "short"
+
+        # ── 1a2. DI squeeze entries ───────────────────────────────────────────
+        _DI_SQUEEZE_ARM = 15.0
+        _plus_di  = row["plus_di"]
+        _minus_di = row["minus_di"]
+        _di_gap   = _plus_di - _minus_di
+
+        if _di_gap >= _DI_SQUEEZE_ARM:
+            self._di_squeeze_bulls_dominant = True
+            self._di_squeeze_bears_dominant = False
+        elif -_di_gap >= _DI_SQUEEZE_ARM:
+            self._di_squeeze_bears_dominant = True
+            self._di_squeeze_bulls_dominant = False
+
+        _ema50_far_enough = abs(close - ema_trend) > 0.0016
+
+        if len(df) >= 3:
+            _pdi0 = df["plus_di"].iloc[-1]
+            _pdi1 = df["plus_di"].iloc[-2]
+            _pdi2 = df["plus_di"].iloc[-3]
+            _mdi0 = df["minus_di"].iloc[-1]
+            _mdi1 = df["minus_di"].iloc[-2]
+            _mdi2 = df["minus_di"].iloc[-3]
+
+            if self._di_squeeze_bulls_dominant:
+                if _pdi0 < _pdi1 < _pdi2 and _ema50_far_enough:
+                    self._di_squeeze_bulls_dominant = False
+                    log.info(
+                        f"SIGNAL short |  di_squeeze fade  adx={row['adx']:.1f}"
+                        f"  plus_di={_plus_di:.2f}  minus_di={_minus_di:.2f}"
+                        f"  gap={_di_gap:.2f}  close={close:.4f}  ema50_dist={abs(close - ema_trend):.4f}"
+                    )
+                    self._last_signal_was_continuation = False
+                    self._last_signal_was_exhaustion_reversal = False
+                    self._last_signal_was_di_snap = False
+                    self._last_signal_was_grind_short = False
+                    self._last_signal_was_macro_cross = False
+                    self._last_signal_was_di_squeeze = True
+                    return "short"
+                elif _pdi0 > _pdi1 > _pdi2 and _ema50_far_enough:
+                    self._di_squeeze_bulls_dominant = False
+                    log.info(
+                        f"SIGNAL long  |  di_squeeze continuation  adx={row['adx']:.1f}"
+                        f"  plus_di={_plus_di:.2f}  minus_di={_minus_di:.2f}"
+                        f"  gap={_di_gap:.2f}  close={close:.4f}  ema50_dist={abs(close - ema_trend):.4f}"
+                    )
+                    self._last_signal_was_continuation = False
+                    self._last_signal_was_exhaustion_reversal = False
+                    self._last_signal_was_di_snap = False
+                    self._last_signal_was_grind_short = False
+                    self._last_signal_was_macro_cross = False
+                    self._last_signal_was_di_squeeze = True
+                    return "long"
+
+            if self._di_squeeze_bears_dominant:
+                if _mdi0 < _mdi1 < _mdi2 and _ema50_far_enough:
+                    self._di_squeeze_bears_dominant = False
+                    log.info(
+                        f"SIGNAL long  |  di_squeeze fade  adx={row['adx']:.1f}"
+                        f"  plus_di={_plus_di:.2f}  minus_di={_minus_di:.2f}"
+                        f"  gap={_di_gap:.2f}  close={close:.4f}  ema50_dist={abs(close - ema_trend):.4f}"
+                    )
+                    self._last_signal_was_continuation = False
+                    self._last_signal_was_exhaustion_reversal = False
+                    self._last_signal_was_di_snap = False
+                    self._last_signal_was_grind_short = False
+                    self._last_signal_was_macro_cross = False
+                    self._last_signal_was_di_squeeze = True
+                    return "long"
+                elif _mdi0 > _mdi1 > _mdi2 and _ema50_far_enough:
+                    self._di_squeeze_bears_dominant = False
+                    log.info(
+                        f"SIGNAL short |  di_squeeze continuation  adx={row['adx']:.1f}"
+                        f"  plus_di={_plus_di:.2f}  minus_di={_minus_di:.2f}"
+                        f"  gap={_di_gap:.2f}  close={close:.4f}  ema50_dist={abs(close - ema_trend):.4f}"
+                    )
+                    self._last_signal_was_continuation = False
+                    self._last_signal_was_exhaustion_reversal = False
+                    self._last_signal_was_di_snap = False
+                    self._last_signal_was_grind_short = False
+                    self._last_signal_was_macro_cross = False
+                    self._last_signal_was_di_squeeze = True
+                    return "short"
 
         # ── 1b. Exhaustion-armed entries (no cross required) ──────────────────
         _plus_di  = row["plus_di"]
@@ -352,7 +563,7 @@ class ScalpingStrategy:
 
         _adx_still_falling = (len(df) >= 2) and (row["adx"] < df["adx"].iloc[-2])
 
-        if self._short_armed and self._exhaustion_sl_lockout == 0 and _adx_still_falling and vol_ok and in_uptrend and ema_sep_ok and _exh_short_ema_gap_ok and _exh_short_bulls_led and close > ema_slow and ema50_rising and _di_balanced_short and _short_candle_ok and rsi_ok_short and not _spike_blocks_short:
+        if self._short_armed and self._exhaustion_sl_lockout == 0 and _adx_still_falling and vol_ok and in_uptrend and ema_sep_ok and _exh_short_ema_gap_ok and _exh_short_bulls_led and close > ema_slow and ema50_rising and _di_balanced_short and _short_candle_ok and rsi_ok_short and not _spike_blocks_short and False:
             self._short_armed = False
             self._short_armed_remaining = 0
             self._last_signal_was_continuation = False
@@ -368,7 +579,7 @@ class ScalpingStrategy:
         _exh_long_ema_gap_ok = (ema_slow - ema_fast) >= 0.5 * atr_val
         _exh_long_bears_led  = _minus_di > _plus_di  # bears were actually dominant
 
-        if self._long_armed and False and self._exhaustion_sl_lockout == 0 and _adx_still_falling and vol_ok and in_downtrend and ema_sep_ok and _exh_long_ema_gap_ok and _exh_long_bears_led and close < ema_slow and ema50_falling and _di_balanced_long and _bulls_leading and _long_candle_ok and rsi_ok_long and not _spike_blocks_long:
+        if self._long_armed and self._exhaustion_sl_lockout == 0 and _adx_still_falling and vol_ok and in_downtrend and ema_sep_ok and _exh_long_ema_gap_ok and _exh_long_bears_led and close < ema_slow and ema50_falling and _di_balanced_long and _bulls_leading and _long_candle_ok and rsi_ok_long and not _spike_blocks_long and False:
             self._long_armed = False
             self._long_armed_remaining = 0
             self._last_signal_was_continuation = False
@@ -453,14 +664,14 @@ class ScalpingStrategy:
         rip_long = (close > row["open"]) and (close > ema_fast)
         rip_short = (close < row["open"]) and (close < ema_fast)
 
-        if strong_uptrend and spike_ok_cont and bias_long and ema_sep_ok and ema50_rising and dipped_long and rip_long and rsi_ok_long and _di_gap_long and not _pump_extended and not _spike_blocks_long:
+        if strong_uptrend and spike_ok_cont and bias_long and ema_sep_ok and ema50_rising and dipped_long and rip_long and rsi_ok_long and _di_gap_long and not _pump_extended and not _spike_blocks_long and False:
             self._last_signal_was_continuation = True
             self._last_signal_was_exhaustion_reversal = False
             self._last_signal_was_di_snap = False
             self._last_signal_was_grind_short = False
             return "long"
 
-        if strong_downtrend and spike_ok_cont and bias_short and ema_sep_ok and ema50_falling and dipped_short and rip_short and rsi_ok_short and _di_gap_short and not _dump_extended and not _spike_blocks_short:
+        if strong_downtrend and spike_ok_cont and bias_short and ema_sep_ok and ema50_falling and dipped_short and rip_short and rsi_ok_short and _di_gap_short and not _dump_extended and not _spike_blocks_short and False:
             self._last_signal_was_continuation = True
             self._last_signal_was_exhaustion_reversal = False
             self._last_signal_was_di_snap = False
@@ -485,9 +696,9 @@ class ScalpingStrategy:
             and close < ema_fast
             and rsi_ok_short
             and not _dump_extended
+            and False
         )
-        # Disable it temporarily.
-        _grind_short = False
+
         if _grind_short:
             self._last_signal_was_continuation = False
             self._last_signal_was_exhaustion_reversal = False
@@ -571,13 +782,17 @@ def _ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
 
+def _wilder(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(com=period - 1, adjust=False).mean()
+
+
 def _atr(df: pd.DataFrame, period: int) -> pd.Series:
     high, low, prev_close = df["high"], df["low"], df["close"].shift(1)
     tr = pd.concat(
         [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
         axis=1,
     ).max(axis=1)
-    return tr.ewm(span=period, adjust=False).mean()
+    return _wilder(tr, period)
 
 
 def _adx(df: pd.DataFrame, period: int) -> tuple[pd.Series, pd.Series, pd.Series]:
@@ -594,15 +809,15 @@ def _adx(df: pd.DataFrame, period: int) -> tuple[pd.Series, pd.Series, pd.Series
         axis=1,
     ).max(axis=1)
 
-    smoothed_tr       = tr.ewm(span=period, adjust=False).mean()
-    smoothed_plus_dm  = plus_dm.ewm(span=period,  adjust=False).mean()
-    smoothed_minus_dm = minus_dm.ewm(span=period, adjust=False).mean()
+    smoothed_tr       = _wilder(tr, period)
+    smoothed_plus_dm  = _wilder(plus_dm, period)
+    smoothed_minus_dm = _wilder(minus_dm, period)
 
     plus_di  = 100 * smoothed_plus_dm  / smoothed_tr.replace(0, float("nan"))
     minus_di = 100 * smoothed_minus_dm / smoothed_tr.replace(0, float("nan"))
 
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, float("nan"))
-    adx = dx.ewm(span=period, adjust=False).mean().fillna(0)
+    adx = _wilder(dx.fillna(0), period)
     return adx, plus_di.fillna(0), minus_di.fillna(0)
 
 
@@ -622,6 +837,8 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ema_trend"]    = _ema(df["close"], EMA_TREND)
     df["atr"]          = _atr(df, cfg.ATR_PERIOD)
     df["adx"], df["plus_di"], df["minus_di"] = _adx(df, ADX_PERIOD)
+    _di_sum  = (df["plus_di"] + df["minus_di"]).replace(0, float("nan"))
+    df["dx"] = (100 * (df["plus_di"] - df["minus_di"]).abs() / _di_sum).fillna(0)
     df["rsi"]          = _rsi(df["close"], RSI_PERIOD)
     df["vol_avg"]      = df["volume"].rolling(VOL_MA, min_periods=1).median()
     df["candle_range"] = df["high"] - df["low"]
@@ -639,5 +856,16 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["cross"] = "none"
     df.loc[bull, "cross"] = "bull"
     df.loc[bear, "cross"] = "bear"
+
+    # EMA21/50 macro cross
+    prev_slow  = df["ema_slow"].shift(1)
+    prev_trend = df["ema_trend"].shift(1)
+
+    macro_bull = (df["ema_slow"] > df["ema_trend"]) & (prev_slow <= prev_trend)
+    macro_bear = (df["ema_slow"] < df["ema_trend"]) & (prev_slow >= prev_trend)
+
+    df["macro_cross"] = "none"
+    df.loc[macro_bull, "macro_cross"] = "bull"
+    df.loc[macro_bear, "macro_cross"] = "bear"
 
     return df
