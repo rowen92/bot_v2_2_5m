@@ -82,6 +82,7 @@ class ScalpingStrategy:
         self._di_squeeze_bulls_dominant: bool = False
         self._di_squeeze_bears_dominant: bool = False
         self._last_signal_was_di_squeeze: bool = False
+        self._last_signal_was_di_squeeze_fade: bool = False
 
     def cancel_exhaustion_arms(self, lockout_candles: int = 6) -> None:
         log.debug(
@@ -111,6 +112,9 @@ class ScalpingStrategy:
 
     def was_di_squeeze(self) -> bool:
         return self._last_signal_was_di_squeeze
+
+    def was_di_squeeze_fade(self) -> bool:
+        return self._last_signal_was_di_squeeze_fade
 
     def di_snap_levels(self) -> dict:
         return self._di_snap_levels
@@ -497,6 +501,7 @@ class ScalpingStrategy:
                     self._last_signal_was_grind_short = False
                     self._last_signal_was_macro_cross = False
                     self._last_signal_was_di_squeeze = True
+                    self._last_signal_was_di_squeeze_fade = True
                     return "short"
                 elif _pdi0 > _pdi1 > _pdi2 and _ema50_far_enough:
                     self._di_squeeze_bulls_dominant = False
@@ -511,6 +516,7 @@ class ScalpingStrategy:
                     self._last_signal_was_grind_short = False
                     self._last_signal_was_macro_cross = False
                     self._last_signal_was_di_squeeze = True
+                    self._last_signal_was_di_squeeze_fade = False
                     return "long"
 
             if self._di_squeeze_bears_dominant:
@@ -527,6 +533,7 @@ class ScalpingStrategy:
                     self._last_signal_was_grind_short = False
                     self._last_signal_was_macro_cross = False
                     self._last_signal_was_di_squeeze = True
+                    self._last_signal_was_di_squeeze_fade = True
                     return "long"
                 elif _mdi0 > _mdi1 > _mdi2 and _ema50_far_enough:
                     self._di_squeeze_bears_dominant = False
@@ -541,6 +548,7 @@ class ScalpingStrategy:
                     self._last_signal_was_grind_short = False
                     self._last_signal_was_macro_cross = False
                     self._last_signal_was_di_squeeze = True
+                    self._last_signal_was_di_squeeze_fade = False
                     return "short"
 
         # ── 1b. Exhaustion-armed entries (no cross required) ──────────────────
