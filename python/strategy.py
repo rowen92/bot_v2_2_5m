@@ -784,3 +784,66 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[macro_bear, "macro_cross"] = "bear"
 
     return df
+
+
+# ── Shared pure-logic helpers (used by both bot and backtest) ─────────────────
+
+def classify_signal(strategy: "ScalpingStrategy") -> str:
+    if strategy.was_exhaustion_reversal():
+        return "exhaustion_armed"
+    if strategy.was_grind_short():
+        return "grind_short"
+    if strategy.was_continuation():
+        return "continuation"
+    if strategy.was_macro_cross():
+        return "macro_cross"
+    if strategy.was_di_squeeze():
+        return "di_squeeze_fade" if strategy.was_di_squeeze_fade() else "di_squeeze_cont"
+    return "cross"
+
+
+def check_flip_allowed(
+    signal: str,
+    indicators: dict,
+    entry_price: float,
+    current_price: float,
+    strategy: "ScalpingStrategy",
+) -> bool:
+    is_exhaustion_flip = strategy.was_exhaustion_reversal()
+    adx_now = indicators.get("adx", 0)
+
+    if not (is_exhaustion_flip or adx_now >= 40):
+        return False
+
+    atr_now    = indicators.get("atr") or 0.0
+    price_move = abs(current_price - entry_price)
+    if not is_exhaustion_flip and atr_now > 0 and price_move < atr_now * cfg.FLIP_MIN_MOVE_ATR:
+        return False
+
+    df   = strategy._cached_df
+    row  = df.iloc[-1]
+    ef   = float(row["ema_fast"])
+    es   = float(row["ema_slow"])
+    et   = float(row["ema_trend"])
+    pdi  = float(row["plus_di"])
+    mdi  = float(row["minus_di"])
+    cl   = float(row["close"])
+
+    if signal == "long":
+        return ef > es and cl > et and pdi > mdi
+    else:
+        return ef < es and cl < et and mdi > pdi
+
+
+def check_exhaustion_entry(
+    pending: dict,
+    candle_close: float,
+    candle_open: float,
+) -> bool:
+    sig      = pending["signal"]
+    regime   = pending.get("regime", "CHOP")
+    pullback = (
+        (sig == "short" and candle_close < candle_open) or
+        (sig == "long"  and candle_close > candle_open)
+    )
+    return pullback and regime == "CHOP"

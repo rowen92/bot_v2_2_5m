@@ -144,6 +144,9 @@ class State:
         # consecutive_sl: how many SL hits in a row without a winning trade between them
         self.consecutive_sl: int = 0
 
+        self.first_trade_of_day_done: bool = False
+        self.first_trade_was_sl: bool = False
+
         # Anti-revenge zone: price and ATR of the last SL hit.
         # risk_manager uses these to block re-entries too close to the same
         # price level where the market just stopped us out.
@@ -219,17 +222,22 @@ class State:
         self.total_trades += 1
         if pnl >= 0:
             self.winning_trades += 1
-            self.consecutive_sl = 0   # reset streak on any win
+            self.consecutive_sl = 0
+            if not self.first_trade_of_day_done:
+                self.first_trade_of_day_done = True
+                self.first_trade_was_sl = False
         else:
             self.losing_trades += 1
-            # Only penalise the streak for a real SL loss, not a breakeven SL
-            # (breakeven SL slides pos.sl_price to entry — fees make pnl slightly
-            # negative but it is not a true directional loss).
             if self.last_close_reason == "sl" and pnl < -0.01:
                 self.consecutive_sl += 1
+                if not self.first_trade_of_day_done:
+                    self.first_trade_of_day_done = True
+                    self.first_trade_was_sl = True
             else:
-                # TRAIL_TP at a loss, FLIP, or breakeven SL — don't stack penalty
                 self.consecutive_sl = 0
+                if not self.first_trade_of_day_done:
+                    self.first_trade_of_day_done = True
+                    self.first_trade_was_sl = False
 
     def daily_loss_pct(self) -> float:
         self._reset_daily_if_needed()
@@ -250,11 +258,16 @@ class State:
             return 0.0
         return (self.daily_realised_pnl / base) * 100
 
+    def reset_day(self) -> None:
+        self.daily_realised_pnl = 0.0
+        self.daily_reset_ts = time.time()
+        self.first_trade_of_day_done = False
+        self.first_trade_was_sl = False
+
     def _reset_daily_if_needed(self) -> None:
         now = time.time()
         if now - self.daily_reset_ts >= 86_400:
-            self.daily_realised_pnl = 0.0
-            self.daily_reset_ts = now
+            self.reset_day()
             if cfg.is_paper():
                 # Snapshot settled balance as the new daily base.
                 # If a position is open at midnight, paper_balance has margin

@@ -81,6 +81,11 @@ class RiskManager:
     def can_trade(self, state: State, live_balance: float | None = None, signal_side: str = "") -> bool:
         """Return True if it is safe to open a new trade right now."""
 
+        # ── First-trade-of-day SL block ───────────────────────────────────────
+        if getattr(state, "first_trade_was_sl", False):
+            log.warning("can_trade=False  reason=first_trade_of_day_was_sl  blocked_until_midnight")
+            return False
+
         # ── Consecutive-SL circuit breaker ────────────────────────────────────
         # After 3 straight SLs, block all new entries for 5 hours (60 × 5m candles).
         # Mirrors backtest.py MAX_CONSECUTIVE_SL=5 / SL_PAUSE_CANDLES=60 logic.

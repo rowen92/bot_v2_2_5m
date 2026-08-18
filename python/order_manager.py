@@ -8,6 +8,7 @@ from binance import AsyncClient
 from config import cfg
 from risk_manager import RiskManager
 from state import Position, State
+from strategy import classify_signal
 import logger as tlog
 
 log = logging.getLogger("orders")
@@ -59,19 +60,10 @@ class OrderManager:
         # Signal type classification — mirrors backtest.py exactly.
         # was_di_squeeze() = di_squeeze_fade or di_squeeze_cont (fixed TP at 2×SL dist).
         # was_exhaustion_reversal() = exhaustion_armed (deferred entry, SL=1×ATR, TP=2×ATR).
-        is_di_squeeze   = strategy is not None and strategy.was_di_squeeze()
-        is_di_squeeze_fade = strategy is not None and is_di_squeeze and strategy.was_di_squeeze_fade()
-        is_grind_short  = strategy is not None and strategy.was_grind_short()
-        is_continuation = strategy is not None and strategy.was_continuation()
-        is_exhaustion   = strategy is not None and strategy.was_exhaustion_reversal()
-
-        sig_type = (
-            ("di_squeeze_fade" if is_di_squeeze_fade else "di_squeeze_cont") if is_di_squeeze else
-            "exhaustion_armed" if is_exhaustion else
-            "continuation"     if is_continuation else
-            "grind_short"      if is_grind_short else
-            "cross"
-        )
+        sig_type       = classify_signal(strategy) if strategy is not None else "cross"
+        is_di_squeeze  = sig_type in ("di_squeeze_fade", "di_squeeze_cont")
+        is_grind_short = sig_type == "grind_short"
+        is_exhaustion  = sig_type == "exhaustion_armed"
 
         sl = rm.sl_price(entry, signal, atr=atr, regime=regime, signal_type=sig_type)
 

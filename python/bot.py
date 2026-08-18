@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from binance import AsyncClient
 from config import cfg
 from state import State
-from strategy import ScalpingStrategy
+from strategy import ScalpingStrategy, check_flip_allowed, check_exhaustion_entry
 from order_manager import OrderManager
 from risk_manager import RiskManager
 from ws_client import run_streams, fetch_open_interest
@@ -114,25 +114,21 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
 
     # ── Deferred exhaustion_armed entry (fires on next candle open) ───────────
     if _pending_exhaustion is not None and state.position is None:
-        pe       = _pending_exhaustion
+        pe      = _pending_exhaustion
         _pending_exhaustion = None
-        pe_atr   = pe["atr"]
-        pe_sig   = pe["signal"]
-        # Pullback filter: entry candle must close in the direction of the trade
+        pe_sig  = pe["signal"]
+        pe_atr  = pe["atr"]
+        pe_regime = pe.get("regime", "CHOP")
         _last_candle = state._candles[-1] if state._candles else None
-        _pullback_ok = (
-            (_last_candle is not None and pe_sig == "short" and _last_candle.close < _last_candle.open) or
-            (_last_candle is not None and pe_sig == "long"  and _last_candle.close > _last_candle.open)
-        )
+        _entry_ok = _last_candle is not None and check_exhaustion_entry(pe, _last_candle.close, _last_candle.open)
         pe_live_bal = None
         if not cfg.is_paper():
             pe_live_bal = await orders._live_balance(client)
-        pe_regime = pe.get("regime", "CHOP")
-        if _pullback_ok and pe_regime == "CHOP" and risk.can_trade(state, live_balance=pe_live_bal, signal_side=pe_sig):
+        if _entry_ok and risk.can_trade(state, live_balance=pe_live_bal, signal_side=pe_sig):
             log.info(f"exhaustion_armed deferred entry firing  signal={pe_sig}  regime={pe_regime}")
             await orders.open_position(pe_sig, state, client, atr=pe_atr, strategy=strategy)
         else:
-            log.info(f"exhaustion_armed deferred entry skipped  pullback_ok={_pullback_ok}  regime={pe_regime}")
+            log.info(f"exhaustion_armed deferred entry skipped  entry_ok={_entry_ok}  regime={pe_regime}")
     # ─────────────────────────────────────────────────────────────────────────
 
     if signal != "none":
@@ -153,60 +149,15 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
             return
 
         if is_flip:
-            # Opposite signal while in a position — close current and flip.
-            # Only fires if signal passed all filters (ADX, volume, spike, trend).
-            # Guard: skip the FLIP if ADX is below 40 or declining (choppy reversal risk).
-            # Exception: exhaustion reversals fire precisely when ADX is falling —
-            # the ADX floor would always suppress them, so bypass it for that case.
-            adx_now   = indicators.get("adx", 0)
-            is_exhaustion_flip = strategy.was_exhaustion_reversal()
-            adx_ok_flip = is_exhaustion_flip or (adx_now >= 40)
-            if not adx_ok_flip:
-                log.debug(
-                    f"FLIP suppressed  adx={adx_now:.1f} < 40  "
-                    f"(choppy market — not reversing)"
-                )
+            if not check_flip_allowed(signal, indicators, pos.entry_price, state.mark_price, strategy):
+                log.info(f"FLIP suppressed (ADX/move/EMA-DI guard) — staying in {pos.side.upper()}")
                 is_flip = False
             else:
-                # Price-movement guard: only flip if price has moved at least
-                # 0.5×ATR from entry. Flipping at entry price just burns fees
-                # with no directional edge (e.g. trade #6: LONG opened at 0.0723,
-                # FLIPped at 0.0723 = -0.55 USDT in fees only).
-                atr_now    = indicators.get("atr") or 0.0
-                price_move = abs(state.mark_price - pos.entry_price)
-                min_move   = atr_now * cfg.FLIP_MIN_MOVE_ATR
-                if not is_exhaustion_flip and atr_now > 0 and price_move < min_move:
-                    log.info(
-                        f"FLIP suppressed — price move too small  "
-                        f"move={price_move:.6f}  min={min_move:.6f} (0.5×ATR)  "
-                        f"entry={pos.entry_price:.6f}  price={state.mark_price:.6f}"
-                    )
-                    is_flip = False
-                else:
-                    # position_is_wrong guard: only FLIP if the new signal's EMA
-                    # stack + DI fully aligns with the new direction.
-                    # Mirrors backtest.py: `if adx_ok and move_ok and position_is_wrong`
-                    _row = strategy._cached_df.iloc[-1]
-                    _ema_fast = float(_row["ema_fast"])
-                    _ema_slow = float(_row["ema_slow"])
-                    _ema_trend = float(_row["ema_trend"])
-                    _plus_di  = float(_row["plus_di"])
-                    _minus_di = float(_row["minus_di"])
-                    _close    = float(_row["close"])
-                    if signal == "long":
-                        position_is_wrong = (_ema_fast > _ema_slow and _close > _ema_trend and _plus_di > _minus_di)
-                    else:
-                        position_is_wrong = (_ema_fast < _ema_slow and _close < _ema_trend and _minus_di > _plus_di)
-                    if not position_is_wrong:
-                        log.info(
-                            f"FLIP suppressed — position_is_wrong=False (EMA/DI not aligned for {signal.upper()})"
-                        )
-                        is_flip = False
-                    else:
-                        log.info(
-                            f"FLIP detected — closing {pos.side.upper()} to open {signal.upper()}"
-                            f"{'  [exhaustion reversal]' if is_exhaustion_flip else ''}"
-                        )
+                log.info(
+                    f"FLIP detected — closing {pos.side.upper()} to open {signal.upper()}"
+                    f"{'  [exhaustion reversal]' if strategy.was_exhaustion_reversal() else ''}"
+                )
+                await orders.close_position("FLIP", state, client)
                         await orders.close_position("FLIP", state, client)
 
         is_exhaustion = strategy.was_exhaustion_reversal()
