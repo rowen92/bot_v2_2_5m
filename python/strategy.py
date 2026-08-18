@@ -116,6 +116,9 @@ class ScalpingStrategy:
     def was_di_squeeze_fade(self) -> bool:
         return self._last_signal_was_di_squeeze_fade
 
+    def was_vol_momentum(self) -> bool:
+        return self._last_signal_was_vol_momentum
+
     def di_snap_levels(self) -> dict:
         return self._di_snap_levels
 
@@ -488,7 +491,7 @@ class ScalpingStrategy:
             _mdi2 = df["minus_di"].iloc[-3]
 
             if self._di_squeeze_bulls_dominant:
-                if _pdi0 < _pdi1 < _pdi2 and _ema50_far_enough:
+                if _pdi0 < _pdi1 < _pdi2 and _ema50_far_enough and False:
                     self._di_squeeze_bulls_dominant = False
                     log.info(
                         f"SIGNAL short |  di_squeeze fade  adx={row['adx']:.1f}"
@@ -503,7 +506,7 @@ class ScalpingStrategy:
                     self._last_signal_was_di_squeeze = True
                     self._last_signal_was_di_squeeze_fade = True
                     return "short"
-                elif _pdi0 > _pdi1 > _pdi2 and _ema50_far_enough:
+                elif _pdi0 > _pdi1 > _pdi2 and _ema50_far_enough and False:
                     self._di_squeeze_bulls_dominant = False
                     log.info(
                         f"SIGNAL long  |  di_squeeze continuation  adx={row['adx']:.1f}"
@@ -520,7 +523,7 @@ class ScalpingStrategy:
                     return "long"
 
             if self._di_squeeze_bears_dominant:
-                if _mdi0 < _mdi1 < _mdi2 and _ema50_far_enough:
+                if _mdi0 < _mdi1 < _mdi2 and _ema50_far_enough and False:
                     self._di_squeeze_bears_dominant = False
                     log.info(
                         f"SIGNAL long  |  di_squeeze fade  adx={row['adx']:.1f}"
@@ -535,7 +538,7 @@ class ScalpingStrategy:
                     self._last_signal_was_di_squeeze = True
                     self._last_signal_was_di_squeeze_fade = True
                     return "long"
-                elif _mdi0 > _mdi1 > _mdi2 and _ema50_far_enough:
+                elif _mdi0 > _mdi1 > _mdi2 and _ema50_far_enough and False:
                     self._di_squeeze_bears_dominant = False
                     log.info(
                         f"SIGNAL short |  di_squeeze continuation  adx={row['adx']:.1f}"
@@ -550,6 +553,88 @@ class ScalpingStrategy:
                     self._last_signal_was_di_squeeze = True
                     self._last_signal_was_di_squeeze_fade = False
                     return "short"
+
+        # ── 1a2. Vol momentum ───────────────────────────────────────────
+        _plus_di  = row["plus_di"]
+        _minus_di = row["minus_di"]
+
+        # # Setup
+        if len(df) >= 7:
+            _vol_prev       = df["volume"].iloc[-2]
+            _vol_prev5_med  = df["volume"].iloc[-7:-2].median()
+            _vol_avg_anchor = row["vol_avg"]
+            _dsq_vol_ok     = (_vol_prev > _vol_prev5_med * 2.0) and (_vol_prev > _vol_avg_anchor * 1.2)
+
+            _prev_body   = abs(df["close"].iloc[-2] - df["open"].iloc[-2])
+            _dsq_body_ok = _prev_body >= atr_val * 0.3
+
+            _adx_cur        = df["adx"].iloc[-1]
+            _adx_prev       = df["adx"].iloc[-2]
+            _dsq_adx_rising = _adx_cur > _adx_prev
+
+            _rsi_cur          = df["rsi"].iloc[-1]
+            _rsi_prev         = df["rsi"].iloc[-2]
+            _dsq_rsi_rising   = _rsi_cur > _rsi_prev
+            _dsq_rsi_declining = _rsi_cur < _rsi_prev
+
+            _pdi_cur          = df["plus_di"].iloc[-1]
+            _pdi_prev         = df["plus_di"].iloc[-2]
+            _mdi_cur          = df["minus_di"].iloc[-1]
+            _mdi_prev         = df["minus_di"].iloc[-2]
+            _dsq_plus_rising  = _pdi_cur > _pdi_prev
+            _dsq_minus_rising = _mdi_cur > _mdi_prev
+
+            _dsq_green = close > row["open"]
+            _dsq_red   = close < row["open"]
+
+            _dsq_long = (
+                _dsq_vol_ok
+                and _dsq_plus_rising
+                and _dsq_adx_rising
+                and _dsq_rsi_rising
+                and _dsq_green
+            )
+            _dsq_short = (
+                _dsq_vol_ok
+                and _dsq_minus_rising
+                and _dsq_adx_rising
+                and _dsq_rsi_declining
+                and _dsq_red
+            )
+
+            if _dsq_long:
+                log.info(
+                    f"SIGNAL long  |  vol_momentum  adx={_adx_cur:.1f}"
+                    f"  +di={_pdi_cur:.2f}(+{_pdi_cur - _pdi_prev:.2f})"
+                    f"  rsi={_rsi_cur:.1f}  vol_prev={_vol_prev:.0f}  vol5med={_vol_prev5_med:.0f}"
+                    f"  close={close:.4f}"
+                )
+                self._last_signal_was_continuation = False
+                self._last_signal_was_exhaustion_reversal = False
+                self._last_signal_was_di_snap = False
+                self._last_signal_was_grind_short = False
+                self._last_signal_was_macro_cross = False
+                self._last_signal_was_di_squeeze = False
+                self._last_signal_was_di_squeeze_fade = False
+                self._last_signal_was_vol_momentum = True
+                return "long"
+
+            if _dsq_short:
+                log.info(
+                    f"SIGNAL short |  vol_momentum  adx={_adx_cur:.1f}"
+                    f"  -di={_mdi_cur:.2f}(+{_mdi_cur - _mdi_prev:.2f})"
+                    f"  rsi={_rsi_cur:.1f}  vol_prev={_vol_prev:.0f}  vol5med={_vol_prev5_med:.0f}"
+                    f"  close={close:.4f}"
+                )
+                self._last_signal_was_continuation = False
+                self._last_signal_was_exhaustion_reversal = False
+                self._last_signal_was_di_snap = False
+                self._last_signal_was_grind_short = False
+                self._last_signal_was_macro_cross = False
+                self._last_signal_was_di_squeeze = False
+                self._last_signal_was_di_squeeze_fade = False
+                self._last_signal_was_vol_momentum = True
+                return "short"
 
         # ── 1b. Exhaustion-armed entries (no cross required) ──────────────────
         _plus_di  = row["plus_di"]
@@ -595,69 +680,6 @@ class ScalpingStrategy:
             self._last_signal_was_di_snap = False
             self._last_signal_was_grind_short = False
             return "long"
-
-        # ── 1c. DI-snap exhaustion entries ────────────────────────────────────
-        _DI_EXTREMITY  = 35.0
-        _DI_ADX_FLOOR  = 20.0
-
-        if len(df) >= 3:
-            _plus_di_n3  = df["plus_di"].iloc[-3]
-            _plus_di_n2  = df["plus_di"].iloc[-2]
-            _plus_di_n1  = df["plus_di"].iloc[-1]
-            _minus_di_n3 = df["minus_di"].iloc[-3]
-            _minus_di_n2 = df["minus_di"].iloc[-2]
-            _minus_di_n1 = df["minus_di"].iloc[-1]
-        else:
-            _plus_di_n3 = _plus_di_n2 = _plus_di_n1 = 0.0
-            _minus_di_n3 = _minus_di_n2 = _minus_di_n1 = 0.0
-
-        _plus_di_snapped  = (_plus_di_n3  > _plus_di_n2  > _plus_di_n1)
-        _minus_di_snapped = (_minus_di_n3 > _minus_di_n2 > _minus_di_n1)
-        _adx_floor_ok     = row["adx"] >= _DI_ADX_FLOOR
-
-        if (
-            _minus_di_n3 >= _DI_EXTREMITY
-            and _minus_di_snapped
-            and close < ema_slow
-            and _adx_floor_ok
-            and vol_ok
-            and ema50_falling
-            and _di_balanced_long
-            and not _spike_blocks_long
-            and False
-        ):
-            _snap_sl = close - 1.0 * atr_val
-            _snap_tp = max(float(ema_slow), close + 1.5 * atr_val)
-            self._last_signal_was_continuation = False
-            self._last_signal_was_exhaustion_reversal = True
-            self._last_signal_was_di_snap = True
-            self._last_signal_was_grind_short = False
-            self._di_snap_levels = {"sl": _snap_sl, "tp": _snap_tp}
-            self._short_armed = False
-            self._short_armed_remaining = 0
-            return "long"
-
-        if (
-            _plus_di_n3 >= _DI_EXTREMITY
-            and _plus_di_snapped
-            and close > ema_slow
-            and _adx_floor_ok
-            and vol_ok
-            and ema50_rising
-            and _di_balanced_short
-            and not _spike_blocks_short
-            and False
-        ):
-            _snap_sl = close + 1.0 * atr_val
-            _snap_tp = max(float(ema_slow), close - 1.5 * atr_val)
-            self._last_signal_was_continuation = False
-            self._last_signal_was_exhaustion_reversal = True
-            self._last_signal_was_di_snap = True
-            self._last_signal_was_grind_short = False
-            self._di_snap_levels = {"sl": _snap_sl, "tp": _snap_tp}
-            self._long_armed = False
-            self._long_armed_remaining = 0
-            return "short"
 
         # ── 2. Trend continuation entries (The Dip & Rip) ─────────────
         strong_uptrend = (ema_fast > ema_slow > ema_trend) and (row["adx"] >= 35.0)
