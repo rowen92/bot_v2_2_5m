@@ -56,19 +56,23 @@ class OrderManager:
             log.warning(f"open skipped: position_size=0  balance={balance:.2f}  entry={entry:.4f}")
             return None
 
-        # DI-snap entries use ATR-based SL + fixed TP at 2R (mirrors backtest.py).
-        # All other entries use ATR-based SL + trail (no fixed TP).
-        is_di_snap      = strategy is not None and strategy.was_di_snap()
+        # Signal type classification — mirrors backtest.py exactly.
+        # was_di_squeeze() = di_squeeze_fade or di_squeeze_cont (fixed TP at 2×SL dist).
+        # was_exhaustion_reversal() = exhaustion_armed (deferred entry, SL=1×ATR, TP=2×ATR).
+        is_di_squeeze   = strategy is not None and strategy.was_di_squeeze()
+        is_di_squeeze_fade = strategy is not None and is_di_squeeze and strategy.was_di_squeeze_fade()
         is_grind_short  = strategy is not None and strategy.was_grind_short()
         is_continuation = strategy is not None and strategy.was_continuation()
         is_exhaustion   = strategy is not None and strategy.was_exhaustion_reversal()
-        # sig_type drives sl_price() multiplier — exhaustion uses regime SL (same as cross)
+
         sig_type = (
-            "di_snap"      if is_di_snap else
-            "continuation" if is_continuation else
-            "grind_short"  if is_grind_short else
-            "cross"        # exhaustion + cross both use regime-based SL mult
+            ("di_squeeze_fade" if is_di_squeeze_fade else "di_squeeze_cont") if is_di_squeeze else
+            "exhaustion_armed" if is_exhaustion else
+            "continuation"     if is_continuation else
+            "grind_short"      if is_grind_short else
+            "cross"
         )
+
         sl = rm.sl_price(entry, signal, atr=atr, regime=regime, signal_type=sig_type)
 
         # Grind short = slot blocker only. Override qty to minimum and SL to
@@ -77,25 +81,29 @@ class OrderManager:
             qty = cfg.QTY_MIN
             sl  = entry + atr * 0.5 if signal == "short" else entry - atr * 0.5
             log.info(f"open_position  [GRIND BLOCKER]  qty={qty}  sl={sl:.4f}")
-        if is_di_snap:
+
+        if is_di_squeeze:
+            # Fixed TP at 2× SL distance — mirrors backtest.py:
+            # atr_dist = abs(sl - entry); tp = entry ± atr_dist * 2
             atr_dist = abs(sl - entry)
             tp = entry - atr_dist * 2 if signal == "short" else entry + atr_dist * 2
             log.info(
-                f"open_position  regime={regime}  signal={signal}  [DI-snap]"
+                f"open_position  regime={regime}  signal={signal}  [{sig_type}]"
                 f"  entry={entry:.4f}  sl={sl:.4f}  tp={tp:.4f}  qty={qty}"
             )
         elif is_exhaustion and atr and atr > 0:
-            sl = entry + atr if signal == "short" else entry - atr
-            tp = entry - atr * 1.5 if signal == "short" else entry + atr * 1.5
+            # SL = 1×ATR, TP = 2×ATR — mirrors backtest.py EXHAUSTION_ARMED_SL_MULT=1.0
+            sl = entry + atr * 1.0 if signal == "short" else entry - atr * 1.0
+            tp = entry - atr * 2.0 if signal == "short" else entry + atr * 2.0
             log.info(
-                f"open_position  regime={regime}  signal={signal}  [exhaustion]"
+                f"open_position  regime={regime}  signal={signal}  [exhaustion_armed]"
                 f"  entry={entry:.4f}  sl={sl:.4f}  tp={tp:.4f}  qty={qty}"
             )
         else:
             tp = 0.0
             log.info(
-                f"open_position  regime={regime}  signal={signal}  "
-                f"entry={entry:.4f}  sl={sl:.4f}  qty={qty}"
+                f"open_position  regime={regime}  signal={signal}  [{sig_type}]"
+                f"  entry={entry:.4f}  sl={sl:.4f}  qty={qty}"
             )
 
         if cfg.is_paper():
@@ -103,29 +111,13 @@ class OrderManager:
         else:
             pos = await self._live_open(signal, entry, qty, tp, sl, client)
 
-        is_exhaustion_armed = is_exhaustion and not is_di_snap
-
         if pos:
-            pos.best_price          = entry    # initialise trailing high-water-mark
-            pos.atr                 = atr      # stored so update_trail() can use ATR-based distances
-            pos.regime              = regime   # frozen at entry — governs trail for the life of this position
-
-            # Signal type — drives trail activation threshold in update_trail().
-            # Continuations use 1.5R, all others use 2.0R (mirrors backtest.py).
-            if is_di_snap:
-                pos.signal_type = "di_snap"
-            elif is_exhaustion:
-                pos.signal_type = "exhaustion_armed"
-            elif is_grind_short:
-                pos.signal_type = "grind_short"
-            elif is_continuation:
-                pos.signal_type = "continuation"
-            else:
-                pos.signal_type = "cross"
-
-            pos.is_di_snap          = is_di_snap
-            pos.di_snap_tp          = tp if (is_di_snap or is_exhaustion) else 0.0
-            pos.is_exhaustion_armed = is_exhaustion_armed
+            pos.best_price          = entry
+            pos.atr                 = atr
+            pos.regime              = regime
+            pos.signal_type         = sig_type
+            pos.di_snap_tp          = tp if (is_di_squeeze or is_exhaustion) else 0.0
+            pos.is_exhaustion_armed = is_exhaustion
             pos.ema21_trail_stop    = 0.0
             state.position = pos
             tlog.log_open(signal, entry, qty, tp, sl, cfg.TRADING_MODE, regime=regime, signal=pos.signal_type)
@@ -344,7 +336,7 @@ class OrderManager:
         has_fixed_tp = pos.di_snap_tp > 0
 
         if has_fixed_tp:
-            # ── Fixed TP: di_snap (2R) and exhaustion_armed (1.5R) ───────────
+            # ── Fixed TP: di_squeeze (2×SL dist) and exhaustion_armed (2×ATR) ──
             if pos.side == "long":
                 if price >= pos.di_snap_tp:
                     hit = "tp"
