@@ -43,13 +43,13 @@ class Config:
     KLINE_INTERVAL: str  = os.getenv("KLINE_INTERVAL", "5m")
 
     # ── Futures ────────────────────────────────────────────────────────────────
-    LEVERAGE: int        = _int("LEVERAGE", 5)
+    LEVERAGE: int        = _int("LEVERAGE", 20)
     MARGIN_TYPE: str     = os.getenv("MARGIN_TYPE", "ISOLATED").upper()
 
     # (old break-retest / OI params removed — strategy is now trend-following)
 
     # ── Risk ───────────────────────────────────────────────────────────────────
-    RISK_PER_TRADE_PCT: float  = _float("RISK_PER_TRADE_PCT", 5.0)
+    RISK_PER_TRADE_PCT: float  = _float("RISK_PER_TRADE_PCT", 20.0)
     # MAX_DAILY_LOSS_PCT: hard stop for the day — no new trades once daily PnL
     # drops below this % of starting balance. Raised to 5% (from 3%) so that
     # a choppy morning doesn't block the afternoon trend (see Step 10 analysis).
