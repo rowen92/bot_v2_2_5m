@@ -46,7 +46,7 @@ class Position:
 
     # Signal type that opened this position — used by update_trail() to set
     # continuation-specific trail activation (1.5R vs 2.0R for other signals).
-    # Values: 'di_snap' | 'exhaustion_armed' | 'continuation' | 'cross'
+    # Values: 'exhaustion_armed' | 'continuation' | 'cross'
     signal_type:     str = ""
 
     # Market regime at entry time — governs SL/TP/trail multipliers for this position.
@@ -60,11 +60,6 @@ class Position:
     trail_active:    bool  = False  # True once activate threshold is crossed
     trail_stop:      float = 0.0   # current trailing stop level
 
-    # DI-snap entries use ATR-based SL + fixed TP at 2R (entry ± 2×sl_dist).
-    # All other entries (exhaustion, continuation, cross) use trail exit only.
-    is_di_snap:      bool  = False  # True if this position was opened by DI-snap logic
-    di_snap_tp:      float = 0.0    # fixed TP = entry ± 2×sl_dist (mirrors backtest.py)
-
     # Exhaustion-armed entries use trail exit only — no flat TP (mirrors backtest.py).
     is_exhaustion_armed:  bool  = False  # True if opened by section 1b armed logic
     tp1_price:            float = 0.0    # unused — kept for state.json deserialisation compat
@@ -72,14 +67,6 @@ class Position:
     # Zombie scratch exit price — set by maybe_exit() before calling close_position()
     # so the exact breakeven price is used instead of the current mark_price tick.
     zombie_exit_price:    float = 0.0
-
-    # Resting limit order ID for zombie scratch — non-empty means the limit order
-    # is live on Binance and we are waiting for it to fill before clearing state.
-    zombie_limit_order_id: str = ""
-
-    # Resting LIMIT GTC order ID for fixed-TP signals (di_snap, exhaustion_armed).
-    # Non-empty means the TP limit is live on Binance; maybe_exit polls it for fill.
-    tp_limit_order_id: str = ""
 
     # Legacy stubs — keep so any stale state.json fields deserialise without error
     tp2_price:            float = 0.0

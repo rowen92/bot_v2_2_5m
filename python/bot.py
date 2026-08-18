@@ -158,7 +158,6 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
                     f"{'  [exhaustion reversal]' if strategy.was_exhaustion_reversal() else ''}"
                 )
                 await orders.close_position("FLIP", state, client)
-                        await orders.close_position("FLIP", state, client)
 
         is_exhaustion = strategy.was_exhaustion_reversal()
 

@@ -112,7 +112,7 @@ class OrderManager:
             pos.atr                 = atr
             pos.regime              = regime
             pos.signal_type         = sig_type
-            pos.di_snap_tp          = tp if (is_di_squeeze or is_exhaustion) else 0.0
+            pos.fixed_tp          = tp if (is_di_squeeze or is_exhaustion) else 0.0
             pos.is_exhaustion_armed = is_exhaustion
             pos.ema21_trail_stop    = 0.0
             state.position = pos
@@ -147,9 +147,6 @@ class OrderManager:
         else:
             result = await self._live_close(pos, exit_price, client, reason=reason)
             if result is None:
-                if reason == "zombie_scratch" and pos.zombie_limit_order_id:
-                    # Limit order is resting — keep position open, poll in maybe_exit
-                    return 0.0
                 log.error(
                     f"live_close failed — keeping position open in state to retry.  "
                     f"side={pos.side}  entry={pos.entry_price:.4f}  qty={pos.qty}"
@@ -213,73 +210,6 @@ class OrderManager:
         if pos is None:
             return
 
-        # ── Zombie limit order: poll for fill ─────────────────────────────────
-        # If a GTC limit was placed for zombie_scratch, skip normal exit logic
-        # and just check whether Binance filled the order yet.
-        if getattr(pos, "zombie_limit_order_id", "") and not cfg.is_paper() and client is not None:
-            if state.is_closing:
-                return
-            try:
-                order = await client.futures_get_order(
-                    symbol=cfg.SYMBOL,
-                    orderId=int(pos.zombie_limit_order_id),
-                )
-                status = order.get("status", "")
-                if status == "FILLED":
-                    actual_exit = float(order.get("avgPrice", pos.zombie_exit_price) or pos.zombie_exit_price)
-                    pnl = rm.calc_pnl(pos.entry_price, actual_exit, pos.qty, pos.side)
-                    log.info(f"zombie_scratch LIMIT filled  exit={actual_exit:.4f}  pnl={pnl:+.4f}")
-                    fresh_balance = await self._live_balance(client)
-                    if fresh_balance > 0:
-                        state.live_balance_snapshot = fresh_balance
-                    tlog.log_close(
-                        pos.side, pos.entry_price, actual_exit,
-                        pos.qty, pnl, "zombie_scratch", cfg.TRADING_MODE,
-                        state.live_balance_snapshot,
-                        pos.open_time,
-                    )
-                    state.last_close_reason = "zombie_scratch"
-                    state.record_pnl(pnl)
-                    state.last_close_ts = time.time()
-                    state.position = None
-                    tlog.log_daily_stats(state)
-                    return
-                elif status in ("CANCELED", "EXPIRED"):
-                    log.warning(f"zombie_scratch LIMIT {status} — falling back to market close")
-                    pos.zombie_limit_order_id = ""
-                    pos.zombie_exit_price = 0.0
-                    state.is_closing = True
-                    try:
-                        await self.close_position("sl", state, client)
-                    finally:
-                        state.is_closing = False
-                    return
-                else:
-                    # Still resting (NEW / PARTIALLY_FILLED) — guard SL while waiting.
-                    candle_close = state.last_candle_close
-                    sl_breached = (
-                        (pos.side == "long"  and candle_close > 0 and candle_close <= pos.sl_price) or
-                        (pos.side == "short" and candle_close > 0 and candle_close >= pos.sl_price)
-                    )
-                    if sl_breached:
-                        log.warning("zombie_scratch limit resting but SL breached — cancelling limit, exiting market")
-                        try:
-                            await client.futures_cancel_order(symbol=cfg.SYMBOL, orderId=int(pos.zombie_limit_order_id))
-                        except Exception as exc:
-                            log.warning(f"zombie_scratch: cancel limit on SL breach failed: {exc}")
-                        pos.zombie_limit_order_id = ""
-                        pos.zombie_exit_price = 0.0
-                        state.is_closing = True
-                        try:
-                            await self.close_position("sl", state, client)
-                        finally:
-                            state.is_closing = False
-                    return
-            except Exception as exc:
-                log.warning(f"zombie_scratch poll failed: {exc}")
-            return
-        # ─────────────────────────────────────────────────────────────────────
-
         # Guard: if a close is already in-flight (previous tick still awaiting
         # Binance response), skip this tick entirely to avoid a double-close.
         if state.is_closing:
@@ -329,17 +259,17 @@ class OrderManager:
                         pos.zombie_exit_price = breakeven_short
                         hit = "zombie_scratch"
 
-        has_fixed_tp = pos.di_snap_tp > 0
+        has_fixed_tp = pos.fixed_tp > 0
 
         if has_fixed_tp:
             # ── Fixed TP: di_squeeze (2×SL dist) and exhaustion_armed (2×ATR) ──
             if pos.side == "long":
-                if price >= pos.di_snap_tp:
+                if price >= pos.fixed_tp:
                     hit = "tp"
                 elif hit is None and candle_close > 0 and candle_close <= pos.sl_price:
                     hit = "sl"
             else:  # short
-                if price <= pos.di_snap_tp:
+                if price <= pos.fixed_tp:
                     hit = "tp"
                 elif hit is None and candle_close > 0 and candle_close >= pos.sl_price:
                     hit = "sl"
@@ -463,24 +393,21 @@ class OrderManager:
 
         # Entry is now LIVE. Guard every subsequent call so we never leave a naked position.
 
-        # TP bracket — di_snap (2R) and exhaustion_armed (1.5R). Trail signals have tp=0 and skip this.
-        # LIMIT GTC rests on the book — fills at exact price, no slippage.
-        tp_limit_order_id = ""
+        # Uses futures_create_algo_order (python-binance >= 1.0.36) which calls
+        # /fapi/v1/algoOrder directly. On failure: log and continue, trail handles exit.
         if tp > 0:
             try:
-                tp_resp = await client.futures_create_order(
+                await client.futures_create_algo_order(
                     symbol=symbol,
                     side=close_side,
-                    type="LIMIT",
-                    timeInForce="GTC",
-                    price=round(tp, cfg.PRICE_PRECISION),
+                    type="TAKE_PROFIT_MARKET",
+                    algoType="CONDITIONAL",
+                    triggerPrice=round(tp, cfg.PRICE_PRECISION),
                     quantity=qty,
                     reduceOnly=True,
                 )
-                tp_limit_order_id = str(tp_resp.get("orderId", ""))
-                log.info(f"live_open TP LIMIT placed  orderId={tp_limit_order_id}  price={tp:.4f}")
             except Exception as exc:
-                log.error(f"live_open TP LIMIT placement failed — maybe_exit will handle exit: {exc}")
+                log.error(f"live_open TP placement failed — trail will handle exit: {exc}")
 
         try:
             # SL bracket — crash-protection ONLY (in case bot process dies).
@@ -512,13 +439,13 @@ class OrderManager:
             try:
                 algo_orders = await client.futures_get_open_algo_orders(symbol=symbol)
                 for o in algo_orders:
-                    await client.futures_cancel_algo_order(symbol=symbol, algoId=o[\"algoId\"])
+                    await client.futures_cancel_algo_order(symbol=symbol, algoId=o["algoId"])
             except Exception:
                 pass
             await OrderManager._emergency_close(client, symbol, close_side, qty)
             return None
 
-        pos = Position(
+        return Position(
             side=signal,
             entry_price=actual_entry,
             qty=qty,
@@ -526,11 +453,9 @@ class OrderManager:
             sl_price=sl,
             order_id=order_id,
         )
-        pos.tp_limit_order_id = tp_limit_order_id
-        return pos
 
     @staticmethod
-    async def _live_close(pos: Position, exit_price: float, client: AsyncClient, reason: str = "") -> float | None:
+    async def _live_close(pos: Position, exit_price: float, client: AsyncClient) -> float | None:
         """
         Returns the realised PnL (float) on success, or None on failure.
         Returning None (not 0.0) lets the caller distinguish a failed close
@@ -578,32 +503,16 @@ class OrderManager:
             except Exception as exc:
                 log.warning(f"live_close: algo order cancel failed (may already be filled): {exc}")
 
-            if reason == "zombie_scratch":
-                resp = await client.futures_create_order(
-                    symbol=cfg.SYMBOL,
-                    side=close_side,
-                    type="LIMIT",
-                    timeInForce="GTC",
-                    price=round(exit_price, cfg.PRICE_PRECISION),
-                    quantity=actual_qty,
-                    reduceOnly=True,
-                )
-                pos.zombie_limit_order_id = str(resp.get("orderId", ""))
-                log.info(
-                    f"zombie_scratch LIMIT placed  orderId={pos.zombie_limit_order_id}"
-                    f"  price={exit_price:.4f}  qty={actual_qty}"
-                )
-                return None  # sentinel: position stays open; poll for fill in maybe_exit
-            else:
-                resp = await client.futures_create_order(
-                    symbol=cfg.SYMBOL,
-                    side=close_side,
-                    type="MARKET",
-                    quantity=actual_qty,
-                    reduceOnly=True,
-                )
-                actual_exit = float(resp.get("avgPrice", exit_price) or exit_price)
-                return rm.calc_pnl(pos.entry_price, actual_exit, pos.qty, pos.side)
+            # Market close — reduceOnly ensures we never flip into a reverse position
+            resp = await client.futures_create_order(
+                symbol=cfg.SYMBOL,
+                side=close_side,
+                type="MARKET",
+                quantity=actual_qty,
+                reduceOnly=True,
+            )
+            actual_exit = float(resp.get("avgPrice", exit_price) or exit_price)
+            return rm.calc_pnl(pos.entry_price, actual_exit, pos.qty, pos.side)
 
         except Exception as exc:
             log.error(f"live_close failed: {exc}")
