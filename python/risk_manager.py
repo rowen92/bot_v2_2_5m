@@ -227,9 +227,9 @@ class RiskManager:
         Falls back to fixed STOP_LOSS_PCT otherwise.
         """
         if atr and atr > 0:
-            if signal_type in ("continuation"):
+            if signal_type == "continuation":
                 sl_mult = cfg.CONTINUATION_SL_MULT
-            elif signal_type in ("di_squeeze"):
+            elif signal_type in ("di_squeeze_fade", "di_squeeze_cont"):
                 sl_mult = 1.5
             else:
                 sl_mult = self.regime_params(regime)["sl"]

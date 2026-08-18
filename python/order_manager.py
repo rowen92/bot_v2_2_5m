@@ -92,9 +92,13 @@ class OrderManager:
                 f"  entry={entry:.4f}  sl={sl:.4f}  tp={tp:.4f}  qty={qty}"
             )
         elif is_exhaustion and atr and atr > 0:
-            # SL = 1×ATR, TP = 2×ATR — mirrors backtest.py EXHAUSTION_ARMED_SL_MULT=1.0
-            sl = entry + atr * 1.0 if signal == "short" else entry - atr * 1.0
-            tp = entry - atr * 2.0 if signal == "short" else entry + atr * 2.0
+            sl  = entry + atr * 1.0 if signal == "short" else entry - atr * 1.0
+            tp  = entry - atr * 2.0 if signal == "short" else entry + atr * 2.0
+            sl_dist = abs(entry - sl)
+            qty = rm.position_size(entry, balance, state=None, atr=sl_dist, regime="CHOP")
+            if qty <= 0:
+                log.warning(f"open skipped: exhaustion_armed position_size=0  balance={balance:.2f}  entry={entry:.4f}")
+                return None
             log.info(
                 f"open_position  regime={regime}  signal={signal}  [exhaustion_armed]"
                 f"  entry={entry:.4f}  sl={sl:.4f}  tp={tp:.4f}  qty={qty}"
@@ -307,9 +311,9 @@ class OrderManager:
             hit = "sl"
 
         # ── Zombie Scratch: breakeven exit after 6 candles (30 min) ──────────
-        # If price has not hit SL/TP after 30 min, scratch the trade at breakeven
-        # if price wicks to breakeven. Mirrors backtest.py zombie scratch logic.
-        ZOMBIE_CANDLES_SECONDS = 6 * 300  # 6 candles × 5 min
+        # di_squeeze signals get 24 candles (2 hours) — mirrors backtest.py _zombie_candles logic.
+        _zombie_candles = 24 if getattr(pos, "signal_type", "") in ("di_squeeze_fade", "di_squeeze_cont") else 6
+        ZOMBIE_CANDLES_SECONDS = _zombie_candles * 300
         if hit is None and open_duration >= ZOMBIE_CANDLES_SECONDS:
             breakeven_long  = rm.breakeven_price(pos.entry_price, "long")
             breakeven_short = rm.breakeven_price(pos.entry_price, "short")

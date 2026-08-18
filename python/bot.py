@@ -20,14 +20,16 @@ strategy = ScalpingStrategy()
 orders   = OrderManager()
 risk     = RiskManager()
 
+_pending_exhaustion: dict | None = None
+
 
 # ---------------------------------------------------------------------------
 # CANDLE CALLBACK  - fires once per closed 5m candle
 # ---------------------------------------------------------------------------
 
 async def on_closed_candle(state: State, client: AsyncClient) -> None:
-    # Fetch OI via REST on every closed candle — this is the only reliable
-    # source of OI data on Binance Futures (not available in any WS stream)
+    global _pending_exhaustion
+
     await fetch_open_interest(client, state)
 
     # ── Position sync guard ───────────────────────────────────────────────────
@@ -110,6 +112,29 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
     if indicators.get("atr"):
         state.live_atr = indicators["atr"]
 
+    # ── Deferred exhaustion_armed entry (fires on next candle open) ───────────
+    if _pending_exhaustion is not None and state.position is None:
+        pe       = _pending_exhaustion
+        _pending_exhaustion = None
+        pe_atr   = pe["atr"]
+        pe_sig   = pe["signal"]
+        # Pullback filter: entry candle must close in the direction of the trade
+        _last_candle = state._candles[-1] if state._candles else None
+        _pullback_ok = (
+            (_last_candle is not None and pe_sig == "short" and _last_candle.close < _last_candle.open) or
+            (_last_candle is not None and pe_sig == "long"  and _last_candle.close > _last_candle.open)
+        )
+        pe_live_bal = None
+        if not cfg.is_paper():
+            pe_live_bal = await orders._live_balance(client)
+        pe_regime = pe.get("regime", "CHOP")
+        if _pullback_ok and pe_regime == "CHOP" and risk.can_trade(state, live_balance=pe_live_bal, signal_side=pe_sig):
+            log.info(f"exhaustion_armed deferred entry firing  signal={pe_sig}  regime={pe_regime}")
+            await orders.open_position(pe_sig, state, client, atr=pe_atr, strategy=strategy)
+        else:
+            log.info(f"exhaustion_armed deferred entry skipped  pullback_ok={_pullback_ok}  regime={pe_regime}")
+    # ─────────────────────────────────────────────────────────────────────────
+
     if signal != "none":
 
         live_bal = None
@@ -158,18 +183,36 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
                     )
                     is_flip = False
                 else:
-                    log.info(
-                        f"FLIP detected — closing {pos.side.upper()} to open {signal.upper()}"
-                        f"{'  [exhaustion reversal]' if is_exhaustion_flip else ''}"
-                    )
-                    await orders.close_position("FLIP", state, client)
+                    # position_is_wrong guard: only FLIP if the new signal's EMA
+                    # stack + DI fully aligns with the new direction.
+                    # Mirrors backtest.py: `if adx_ok and move_ok and position_is_wrong`
+                    _row = strategy._cached_df.iloc[-1]
+                    _ema_fast = float(_row["ema_fast"])
+                    _ema_slow = float(_row["ema_slow"])
+                    _ema_trend = float(_row["ema_trend"])
+                    _plus_di  = float(_row["plus_di"])
+                    _minus_di = float(_row["minus_di"])
+                    _close    = float(_row["close"])
+                    if signal == "long":
+                        position_is_wrong = (_ema_fast > _ema_slow and _close > _ema_trend and _plus_di > _minus_di)
+                    else:
+                        position_is_wrong = (_ema_fast < _ema_slow and _close < _ema_trend and _minus_di > _plus_di)
+                    if not position_is_wrong:
+                        log.info(
+                            f"FLIP suppressed — position_is_wrong=False (EMA/DI not aligned for {signal.upper()})"
+                        )
+                        is_flip = False
+                    else:
+                        log.info(
+                            f"FLIP detected — closing {pos.side.upper()} to open {signal.upper()}"
+                            f"{'  [exhaustion reversal]' if is_exhaustion_flip else ''}"
+                        )
+                        await orders.close_position("FLIP", state, client)
+
+        is_exhaustion = strategy.was_exhaustion_reversal()
 
         # CHOP block: skip new entries (not flips) when market regime is CHOP.
-        # ADX < 45 = no real momentum — entries in this regime have no edge on WLD.
-        # Flips are exempt: closing + reversing on a hard opposite signal is still valid.
-        # Exhaustion reversals are exempt: they fire precisely when ADX is falling
-        # (CHOP regime by definition) — blocking them defeats their purpose.
-        is_exhaustion = strategy.was_exhaustion_reversal()
+        # Flips are exempt. Exhaustion reversals are exempt (fire when ADX falls).
         if cfg.CHOP_BLOCK and not is_flip and not is_exhaustion:
             regime_now = strategy.market_regime(state)
             if regime_now == "CHOP":
@@ -178,8 +221,17 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
                 )
                 return
 
+        # ── Exhaustion armed: defer entry to next candle ──────────────────────
+        if is_exhaustion and not is_flip:
+            atr    = indicators.get("atr")
+            regime = strategy.market_regime(state)
+            _pending_exhaustion = {"signal": signal, "atr": atr, "regime": regime}
+            log.info(f"exhaustion_armed deferred — will enter on next candle open  signal={signal}  regime={regime}")
+            return
+        # ─────────────────────────────────────────────────────────────────────
+
         if is_flip or risk.can_trade(state, live_balance=live_bal, signal_side=signal):
-            atr = indicators.get("atr")   # float from strategy snapshot, or None
+            atr = indicators.get("atr")
             await orders.open_position(signal, state, client, atr=atr, strategy=strategy)
         else:
             log.debug(f"SIGNAL={signal.upper()} blocked by can_trade — see risk log above")
@@ -190,16 +242,13 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
 # ---------------------------------------------------------------------------
 
 async def on_tick(state: State, client: AsyncClient) -> None:
+    global _pending_exhaustion
     had_position = state.position is not None
     await orders.maybe_exit(state, client)
-    # After a position closes on this tick
     if had_position and state.position is None:
-        # Cancel exhaustion arms on SL — mirrors backtest.py line 480.
-        # Must happen here (on_tick) not on_closed_candle, because the next
-        # mark-price tick could fire an exhaustion entry before the candle closes.
         if state.last_close_reason == "sl":
             strategy.cancel_exhaustion_arms()
-        # Refresh live balance snapshot (live mode only)
+            _pending_exhaustion = None
         if not cfg.is_paper():
             state.live_balance_snapshot = await orders._live_balance(client)
 
