@@ -455,7 +455,7 @@ class OrderManager:
         )
 
     @staticmethod
-    async def _live_close(pos: Position, exit_price: float, client: AsyncClient) -> float | None:
+    async def _live_close(pos: Position, exit_price: float, client: AsyncClient, reason: str = "") -> float | None:
         """
         Returns the realised PnL (float) on success, or None on failure.
         Returning None (not 0.0) lets the caller distinguish a failed close
