@@ -42,11 +42,6 @@ def _parse_kline(data: dict, state: State) -> None:
         )
 
 
-def _parse_depth(data: dict, state: State) -> None:
-    state.bids = {float(p): float(q) for p, q in data.get("b", []) if float(q) > 0}
-    state.asks = {float(p): float(q) for p, q in data.get("a", []) if float(q) > 0}
-
-
 def _parse_mark_price(data: dict, state: State) -> None:
     """
     markPrice stream payload carries: p (mark price), i (index price),
@@ -172,45 +167,32 @@ async def run_streams(
     interval = cfg.KLINE_INTERVAL
 
     kline_stream = f"{sym}@kline_{interval}"
-    depth_stream = f"{sym}@depth20@100ms"
     mark_stream  = f"{sym}@markPrice@1s"
 
-    # Pre-seed historical candles so indicators are fully converged before
-    # the first live signal — this makes bot behaviour match backtest exactly.
     await preseed_candles(client, state)
 
     log.info(
-        f"Subscribing — kline: {kline_stream}  depth: {depth_stream}"
+        f"Subscribing — kline: {kline_stream}"
         f"  markPrice: {mark_stream}  (OI via REST per candle)"
     )
 
-    last_processed_open_time = 0  # tracks last candle we ran on_closed_candle for
+    last_processed_open_time = 0
 
     async def handle_kline(data: dict) -> None:
         nonlocal last_processed_open_time
-        # Capture whether the *previous* live candle was already closed before
-        # we parse this message. The callback fires only on the transition
-        # open→closed, not on every tick of an already-closed candle.
         prev_closed = state.live_candle is not None and state.live_candle.is_closed
         _parse_kline(data, state)
         just_closed = state.live_candle is not None and state.live_candle.is_closed
-        # Guard against WS reconnect replaying the last closed candle — only
-        # fire on_closed_candle once per unique open_time.
         candle_open_time = state.live_candle.open_time if state.live_candle else 0
         if just_closed and not prev_closed and candle_open_time != last_processed_open_time:
             last_processed_open_time = candle_open_time
             await on_closed_candle(state)
 
-    async def handle_depth(data: dict) -> None:
-        _parse_depth(data, state)
-        # depth updates order book only — TP/SL checks run on mark price ticks
-
     async def handle_mark(data: dict) -> None:
         _parse_mark_price(data, state)
-        await on_tick(state)  # only mark price drives exit checks
+        await on_tick(state)
 
     await asyncio.gather(
-        _run_stream(_WS_MARKET, kline_stream, handle_kline),   # kline = market stream
-        _run_stream(_WS_PUBLIC, depth_stream, handle_depth),   # depth = public stream
-        _run_stream(_WS_MARKET, mark_stream,  handle_mark),    # markPrice = market stream
+        _run_stream(_WS_MARKET, kline_stream, handle_kline),
+        _run_stream(_WS_MARKET, mark_stream,  handle_mark),
     )

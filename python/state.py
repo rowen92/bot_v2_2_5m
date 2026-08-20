@@ -1,5 +1,5 @@
 """
-state.py – shared in-memory state (candles, order book, current position, stats).
+state.py – shared in-memory state (candles, position, stats).
 A single `State` instance is created in bot.py and passed around.
 Thread-safe via asyncio (single-threaded event loop).
 """
@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 import pandas as pd
 
@@ -81,18 +81,11 @@ class Position:
 
 class State:
     def __init__(self):
-        # Rolling candle buffer — ~16 hours of 1m candles.
-        # Memory cost is negligible (~56 bytes/candle → ~56 KB total).
-        # The cache-key fix (len, last_open_time) handles indicator freshness;
-        # this larger window gives vol_avg and EMA a stable long-term baseline.
+        # Rolling candle buffer — 1000 × 5m = ~83 hours.
         self._candles: deque[Candle] = deque(maxlen=1000)
 
         # Latest (possibly open) candle being built from the stream
         self.live_candle: Optional[Candle] = None
-
-        # Order book snapshot {price: qty} for bids and asks
-        self.bids: dict[float, float] = {}
-        self.asks: dict[float, float] = {}
 
         # Mark price (more reliable than last trade for futures)
         self.mark_price: float = 0.0
@@ -186,20 +179,6 @@ class State:
             for c in self._candles
         ]
         return pd.DataFrame(rows)
-
-    # ── Order book helpers ─────────────────────────────────────────────────────
-
-    def best_bid(self) -> float:
-        return max(self.bids.keys(), default=0.0)
-
-    def best_ask(self) -> float:
-        return min(self.asks.keys(), default=0.0)
-
-    def mid_price(self) -> float:
-        bb, ba = self.best_bid(), self.best_ask()
-        if bb and ba:
-            return (bb + ba) / 2
-        return self.mark_price
 
     # ── Daily PnL ─────────────────────────────────────────────────────────────
 
