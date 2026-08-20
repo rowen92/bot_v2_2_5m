@@ -112,24 +112,32 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
     if indicators.get("atr"):
         state.live_atr = indicators["atr"]
 
-    # ── Deferred exhaustion_armed entry (fires on next candle open) ───────────
+    # ── Deferred exhaustion_armed: validate + enter at confirmation candle open ─
     if _pending_exhaustion is not None and state.position is None:
-        pe      = _pending_exhaustion
+        pe   = _pending_exhaustion
         _pending_exhaustion = None
-        pe_sig  = pe["signal"]
-        pe_atr  = pe["atr"]
-        pe_regime = pe.get("regime", "CHOP")
-        _last_candle = state._candles[-1] if state._candles else None
-        _entry_ok = _last_candle is not None and check_exhaustion_entry(pe, _last_candle.close, _last_candle.open)
-        pe_live_bal = None
-        if not cfg.is_paper():
-            pe_live_bal = await orders._live_balance(client)
-        if _entry_ok and risk.can_trade(state, live_balance=pe_live_bal, signal_side=pe_sig):
-            log.info(f"exhaustion_armed deferred entry firing  signal={pe_sig}  regime={pe_regime}")
-            await orders.open_position(pe_sig, state, client, atr=pe_atr, strategy=strategy,
-                                       signal_candle_open_time=pe.get("signal_candle_open_time", 0.0))
+        conf = state._candles[-1] if state._candles else None
+        if conf is not None and check_exhaustion_entry(pe, conf.close, conf.open):
+            pe_sig = pe["signal"]
+            pe_atr = pe["atr"]
+            pe_regime = pe.get("regime", "CHOP")
+            pe_live_bal = None
+            if not cfg.is_paper():
+                pe_live_bal = await orders._live_balance(client)
+            if risk.can_trade(state, live_balance=pe_live_bal, signal_side=pe_sig):
+                log.info(
+                    f"exhaustion_armed entry  signal={pe_sig}  regime={pe_regime}"
+                    f"  entry={conf.open:.4f}  (confirmation candle open)"
+                )
+                _saved_mark = state.mark_price
+                state.mark_price = conf.open
+                await orders.open_position(pe_sig, state, client, atr=pe_atr, strategy=strategy,
+                                           signal_candle_open_time=pe.get("signal_candle_open_time", 0.0))
+                state.mark_price = _saved_mark
+            else:
+                log.info(f"exhaustion_armed entry skipped — can_trade blocked  signal={pe_sig}")
         else:
-            log.info(f"exhaustion_armed deferred entry skipped  entry_ok={_entry_ok}  regime={pe_regime}")
+            log.info(f"exhaustion_armed cancelled — confirmation candle not bearish  signal={pe.get('signal')}")
     # ─────────────────────────────────────────────────────────────────────────
 
     if signal != "none":
@@ -205,6 +213,10 @@ async def on_tick(state: State, client: AsyncClient) -> None:
             _pending_exhaustion = None
         if not cfg.is_paper():
             state.live_balance_snapshot = await orders._live_balance(client)
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
