@@ -57,7 +57,7 @@ def setup_logging() -> None:
 
     # ── Console handler (coloured) ─────────────────────────────────────────
     console = colorlog.StreamHandler(sys.stdout)
-    console.setLevel(logging.DEBUG)
+    console.setLevel(logging.INFO)
     console.setFormatter(
         colorlog.ColoredFormatter(
             "%(log_color)s%(asctime)s  %(levelname)-8s%(reset)s %(name)-14s %(message)s",
