@@ -73,6 +73,13 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
                     f"closed externally. exit={real_exit:.4f}  pnl={real_pnl:+.4f}  "
                     f"reason={close_reason}. Clearing state."
                 )
+                try:
+                    await client.futures_cancel_all_open_orders(symbol=cfg.SYMBOL)
+                    algo_orders = await client.futures_get_open_algo_orders(symbol=cfg.SYMBOL)
+                    for o in algo_orders:
+                        await client.futures_cancel_algo_order(symbol=cfg.SYMBOL, algoId=o["algoId"])
+                except Exception as exc:
+                    log.warning(f"Position sync: order cleanup failed: {exc}")
                 # Refresh balance so log_close shows the post-trade value
                 fresh_balance = await orders._live_balance(client)
                 if fresh_balance > 0:
