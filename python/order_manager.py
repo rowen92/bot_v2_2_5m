@@ -28,6 +28,7 @@ class OrderManager:
         client: Optional[AsyncClient] = None,
         atr: float | None = None,
         strategy=None,
+        signal_candle_open_time: float = 0.0,
     ) -> Optional[Position]:
         """Open a long or short futures position.
 
@@ -112,9 +113,10 @@ class OrderManager:
             pos.atr                 = atr
             pos.regime              = regime
             pos.signal_type         = sig_type
-            pos.fixed_tp          = tp if (is_di_squeeze or is_exhaustion) else 0.0
+            pos.fixed_tp            = tp if (is_di_squeeze or is_exhaustion) else 0.0
             pos.is_exhaustion_armed = is_exhaustion
             pos.ema21_trail_stop    = 0.0
+            pos.open_time           = signal_candle_open_time if signal_candle_open_time > 0 else time.time()
             state.position = pos
             tlog.log_open(signal, entry, qty, tp, sl, cfg.TRADING_MODE, regime=regime, signal=pos.signal_type)
 
@@ -241,20 +243,16 @@ class OrderManager:
             breakeven_short = rm.breakeven_price(pos.entry_price, "short")
 
             if pos.side == "long":
-                # Let it run if we are already in profit at current close
-                if candle_close > 0 and candle_close > breakeven_long:
+                if price > breakeven_long:
                     pass
                 elif price >= breakeven_long:
-                    # Wicked up to breakeven — scratch it
                     if not (pos.trail_active and pos.trail_stop > breakeven_long):
                         pos.zombie_exit_price = breakeven_long
                         hit = "zombie_scratch"
             elif pos.side == "short":
-                # Let it run if we are already in profit at current close
-                if candle_close > 0 and candle_close < breakeven_short:
+                if price < breakeven_short:
                     pass
                 elif price <= breakeven_short:
-                    # Wicked down to breakeven — scratch it
                     if not (pos.trail_active and pos.trail_stop < breakeven_short):
                         pos.zombie_exit_price = breakeven_short
                         hit = "zombie_scratch"

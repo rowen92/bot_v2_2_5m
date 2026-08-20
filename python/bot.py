@@ -126,7 +126,8 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
             pe_live_bal = await orders._live_balance(client)
         if _entry_ok and risk.can_trade(state, live_balance=pe_live_bal, signal_side=pe_sig):
             log.info(f"exhaustion_armed deferred entry firing  signal={pe_sig}  regime={pe_regime}")
-            await orders.open_position(pe_sig, state, client, atr=pe_atr, strategy=strategy)
+            await orders.open_position(pe_sig, state, client, atr=pe_atr, strategy=strategy,
+                                       signal_candle_open_time=pe.get("signal_candle_open_time", 0.0))
         else:
             log.info(f"exhaustion_armed deferred entry skipped  entry_ok={_entry_ok}  regime={pe_regime}")
     # ─────────────────────────────────────────────────────────────────────────
@@ -175,14 +176,17 @@ async def on_closed_candle(state: State, client: AsyncClient) -> None:
         if is_exhaustion and not is_flip:
             atr    = indicators.get("atr")
             regime = strategy.market_regime(state)
-            _pending_exhaustion = {"signal": signal, "atr": atr, "regime": regime}
+            _sig_ts = state._candles[-1].open_time / 1000 if state._candles else 0.0
+            _pending_exhaustion = {"signal": signal, "atr": atr, "regime": regime, "signal_candle_open_time": _sig_ts}
             log.info(f"exhaustion_armed deferred — will enter on next candle open  signal={signal}  regime={regime}")
             return
         # ─────────────────────────────────────────────────────────────────────
 
         if is_flip or risk.can_trade(state, live_balance=live_bal, signal_side=signal):
             atr = indicators.get("atr")
-            await orders.open_position(signal, state, client, atr=atr, strategy=strategy)
+            _signal_candle_ts = state._candles[-1].open_time / 1000 if state._candles else 0.0
+            await orders.open_position(signal, state, client, atr=atr, strategy=strategy,
+                                       signal_candle_open_time=_signal_candle_ts)
         else:
             log.debug(f"SIGNAL={signal.upper()} blocked by can_trade — see risk log above")
 

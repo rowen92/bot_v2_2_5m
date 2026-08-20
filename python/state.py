@@ -37,7 +37,7 @@ class Position:
     qty:         float  # in base asset units (e.g. WLD)
     tp_price:    float
     sl_price:    float
-    open_time:   float = field(default_factory=time.time)
+    open_time:   float = 0.0
     order_id:    Optional[str] = None
     open_fee:    float = 0.0  # taker fee paid at entry (stored for accurate pnl reporting)
 
