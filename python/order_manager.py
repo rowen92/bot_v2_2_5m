@@ -245,17 +245,15 @@ class OrderManager:
             if pos.side == "long":
                 if price > breakeven_long:
                     pass
-                elif price >= breakeven_long:
-                    if not (pos.trail_active and pos.trail_stop > breakeven_long):
-                        pos.zombie_exit_price = breakeven_long
-                        hit = "zombie_scratch"
+                elif not (pos.trail_active and pos.trail_stop > breakeven_long):
+                    pos.zombie_exit_price = price
+                    hit = "zombie_scratch"
             elif pos.side == "short":
                 if price < breakeven_short:
                     pass
-                elif price <= breakeven_short:
-                    if not (pos.trail_active and pos.trail_stop < breakeven_short):
-                        pos.zombie_exit_price = breakeven_short
-                        hit = "zombie_scratch"
+                elif not (pos.trail_active and pos.trail_stop < breakeven_short):
+                    pos.zombie_exit_price = price
+                    hit = "zombie_scratch"
 
         has_fixed_tp = pos.fixed_tp > 0
 
